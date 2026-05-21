@@ -1,14 +1,17 @@
-# Iusprudentia Poenalis - Serveur MCP v8
-# Streamable HTTP avec gestion des sessions (Mcp-Session-Id)
+# Iusprudentia Poenalis - Serveur MCP v9
+# Chargement automatique depuis Google Drive + endpoint /reload
 import json
 import re
 import unicodedata
 import os
 import uuid
 import logging
+import io
 from pathlib import Path
 
 import httpx
+import pandas as pd
+from openpyxl import load_workbook
 from bs4 import BeautifulSoup
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -22,20 +25,96 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Chargement des données
+# Configuration
 # ---------------------------------------------------------------------------
-DATA_PATH = Path(__file__).parent / "arrets.json"
-with open(DATA_PATH, encoding="utf-8") as f:
-    ARRETS = json.load(f)
-ARRETS_BY_ID = {r["arret"]: r for r in ARRETS if r.get("arret")}
+GDRIVE_FILE_ID = os.environ.get("GDRIVE_FILE_ID", "18ylKTce78zSdEpeJ8tBbPchPIGs-kG4w")
+RELOAD_KEY     = os.environ.get("RELOAD_KEY", "iuris2026")
+GDRIVE_URL     = f"https://docs.google.com/spreadsheets/d/{GDRIVE_FILE_ID}/export?format=xlsx"
 
-logger.info(f"=== Iusprudentia Poenalis MCP v8 : {len(ARRETS)} arrets charges ===")
+# ---------------------------------------------------------------------------
+# Chargement et conversion Excel → liste de dicts
+# ---------------------------------------------------------------------------
+def parse_excel(content: bytes) -> list:
+    sheets = pd.read_excel(io.BytesIO(content), sheet_name=None)
+    wb     = load_workbook(io.BytesIO(content))
 
-# Stockage des sessions actives
+    # Extraire les hyperliens
+    url_map = {}
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        for row in ws.iter_rows():
+            for cell in row:
+                if cell.hyperlink and cell.value:
+                    url_map[str(cell.value).strip()] = cell.hyperlink.target
+
+    all_rows = []
+    for sheet_name, df in sheets.items():
+        if sheet_name == "2021-2024":
+            df.columns = df.iloc[0]
+            df = df.iloc[1:].reset_index(drop=True)
+        for _, row in df.iterrows():
+            r = {}
+            for col in df.columns:
+                val = row.get(col, None)
+                if pd.notna(val):
+                    r[str(col).strip()] = str(val)
+            all_rows.append(r)
+
+    trimmed = []
+    for r in all_rows:
+        arret    = r.get("Arrêt", "").strip()
+        parution = r.get("Date de parution", "")
+        decision = r.get("Date de la décision", "")
+        trimmed.append({
+            "arret":    arret,
+            "parution": parution.split(" ")[0] if "00:00:00" in parution else parution,
+            "decision": decision.split(" ")[0] if "00:00:00" in decision else decision,
+            "objet":    r.get("Objet", ""),
+            "articles": r.get("Articles", ""),
+            "resume":   r.get("Résumé", ""),
+            "langue":   r.get("Langue", "").strip() if r.get("Langue") else "",
+            "interet":  r.get("Arrêt d'intérêt", "").strip() if r.get("Arrêt d'intérêt") else r.get("Arrêt d intérêt", ""),
+            "admis":    r.get("Admis/rejeté", ""),
+            "peine":    r.get("Peine prononcée", ""),
+            "url":      url_map.get(arret, ""),
+        })
+
+    return [r for r in trimmed if r["arret"]]
+
+
+def load_from_gdrive() -> tuple:
+    logger.info(f"Téléchargement depuis Google Drive : {GDRIVE_URL}")
+    resp = httpx.get(GDRIVE_URL, timeout=60, follow_redirects=True)
+    resp.raise_for_status()
+    data = parse_excel(resp.content)
+    by_id = {r["arret"]: r for r in data}
+    logger.info(f"=== {len(data)} arrêts chargés depuis Google Drive ===")
+    return data, by_id
+
+
+def load_from_local() -> tuple:
+    local = Path(__file__).parent / "arrets.json"
+    if local.exists():
+        with open(local, encoding="utf-8") as f:
+            data = json.load(f)
+        by_id = {r["arret"]: r for r in data if r.get("arret")}
+        logger.info(f"=== {len(data)} arrêts chargés depuis arrets.json (local) ===")
+        return data, by_id
+    return [], {}
+
+
+# Chargement initial
+try:
+    ARRETS, ARRETS_BY_ID = load_from_gdrive()
+except Exception as e:
+    logger.warning(f"Google Drive inaccessible ({e}), chargement local.")
+    ARRETS, ARRETS_BY_ID = load_from_local()
+
+# Sessions actives
 SESSIONS = {}
 
 # ---------------------------------------------------------------------------
-# Définition des outils
+# Outils MCP
 # ---------------------------------------------------------------------------
 TOOLS = [
     {
@@ -44,11 +123,11 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Mots-cles de recherche"},
-                "infraction": {"type": "string", "description": "Type d infraction ex: Expulsion"},
-                "article": {"type": "string", "description": "Article de loi ex: 66a CP"},
-                "annee": {"type": "string", "description": "Annee ex: 2024"},
-                "limite": {"type": "integer", "description": "Nombre de resultats max 30"}
+                "query":      {"type": "string",  "description": "Mots-cles de recherche"},
+                "infraction": {"type": "string",  "description": "Type d infraction ex: Expulsion"},
+                "article":    {"type": "string",  "description": "Article de loi ex: 66a CP"},
+                "annee":      {"type": "string",  "description": "Annee ex: 2024"},
+                "limite":     {"type": "integer", "description": "Nombre de resultats max 30"}
             },
             "required": ["query"]
         }
@@ -101,25 +180,26 @@ def score_arret(arret, query_words):
     score = 0
     for word in query_words:
         w = normalize(word)
-        if w in normalize(arret.get("objet", "")): score += 4
-        if w in normalize(arret.get("resume", "")): score += 2
+        if w in normalize(arret.get("objet",    "")): score += 4
+        if w in normalize(arret.get("resume",   "")): score += 2
         if w in normalize(arret.get("articles", "")): score += 3
-        if w in normalize(arret.get("arret", "")): score += 5
+        if w in normalize(arret.get("arret",    "")): score += 5
     if arret.get("interet") == "oui":
         score += 1
     return score
 
 
 def search_arrets(query="", infraction="", article="", annee="", limite=10):
-    limite = min(int(limite), 30)
+    limite      = min(int(limite), 30)
     query_words = query.strip().split() if query.strip() else []
-    results = []
+    results     = []
     for arret in ARRETS:
         if infraction and not normalize(arret.get("objet", "")).startswith(normalize(infraction)):
             continue
         if article and normalize(article) not in normalize(arret.get("articles", "")):
             continue
-        if annee and not (arret.get("decision", "").startswith(annee) or arret.get("parution", "").startswith(annee)):
+        if annee and not (arret.get("decision", "").startswith(annee) or
+                          arret.get("parution",  "").startswith(annee)):
             continue
         score = score_arret(arret, query_words) if query_words else 1
         if score > 0 or not query_words:
@@ -131,28 +211,29 @@ def search_arrets(query="", infraction="", article="", annee="", limite=10):
     lines = [str(len(results)) + " arret(s) trouve(s)\n"]
     for _, r in results:
         lines.append("### " + r["arret"])
-        lines.append("- Objet : " + r.get("objet", "-"))
-        lines.append("- Date : " + r.get("decision", "-"))
+        lines.append("- Objet : "    + r.get("objet",    "-"))
+        lines.append("- Date : "     + r.get("decision", "-"))
         lines.append("- Articles : " + r.get("articles", "-"))
-        if r.get("admis"): lines.append("- Resultat : " + r["admis"])
+        if r.get("admis"):             lines.append("- Resultat : " + r["admis"])
         if r.get("interet") == "oui": lines.append("- Arret d interet")
-        if r.get("resume"): lines.append("- Resume : " + r["resume"])
-        if r.get("url"): lines.append("- URL : " + r["url"])
+        if r.get("resume"):            lines.append("- Resume : " + r["resume"])
+        if r.get("url"):               lines.append("- URL : " + r["url"])
         lines.append("")
     return "\n".join(lines)
 
 
 def get_fulltext(arret_id):
     arret = ARRETS_BY_ID.get(arret_id)
-    url = arret.get("url") if arret else None
+    url   = arret.get("url") if arret else None
     if not url:
-        clean_id = re.sub(r"[^A-Za-z0-9_/.-]", "", arret_id)[:40]
-        url = "https://www.bger.ch/ext/eurospider/live/fr/php/aza/http/index.php?lang=fr&type=show_document&highlight_docid=aza://" + clean_id
+        cid = re.sub(r"[^A-Za-z0-9_/.-]", "", arret_id)[:40]
+        url = ("https://www.bger.ch/ext/eurospider/live/fr/php/aza/http/index.php"
+               f"?lang=fr&type=show_document&highlight_docid=aza://{cid}")
     try:
-        resp = httpx.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"}, follow_redirects=True)
+        resp = httpx.get(url, timeout=20,
+                         headers={"User-Agent": "Mozilla/5.0"}, follow_redirects=True)
         soup = BeautifulSoup(resp.text, "html.parser")
-        for tag in soup(["script", "style", "nav", "header", "footer"]):
-            tag.decompose()
+        for tag in soup(["script","style","nav","header","footer"]): tag.decompose()
         lines = [l.rstrip() for l in soup.get_text(separator="\n").splitlines() if l.strip()]
         return "Arret " + arret_id + "\nURL : " + url + "\n" + "-"*60 + "\n\n" + "\n".join(lines)[:15000]
     except Exception as e:
@@ -161,17 +242,22 @@ def get_fulltext(arret_id):
 
 def get_references(arret_id):
     arret = ARRETS_BY_ID.get(arret_id)
-    url = arret.get("url") if arret else None
+    url   = arret.get("url") if arret else None
     if not url:
-        clean_id = re.sub(r"[^A-Za-z0-9_/.-]", "", arret_id)[:40]
-        url = "https://www.bger.ch/ext/eurospider/live/fr/php/aza/http/index.php?lang=fr&type=show_document&highlight_docid=aza://" + clean_id
+        cid = re.sub(r"[^A-Za-z0-9_/.-]", "", arret_id)[:40]
+        url = ("https://www.bger.ch/ext/eurospider/live/fr/php/aza/http/index.php"
+               f"?lang=fr&type=show_document&highlight_docid=aza://{cid}")
     try:
-        resp = httpx.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"}, follow_redirects=True)
+        resp = httpx.get(url, timeout=20,
+                         headers={"User-Agent": "Mozilla/5.0"}, follow_redirects=True)
         text = BeautifulSoup(resp.text, "html.parser").get_text(separator=" ")
     except Exception as e:
         return "Erreur : " + str(e)
     atf_refs = sorted(set(re.findall(r"ATF\s+\d{2,3}\s+[IVX]+\s+\d+", text)))
-    tf_refs = sorted(set(r for r in re.findall(r"\b[0-9][A-Z]{1,2}_\d{1,4}/20\d{2}\b", text) if r != arret_id))
+    tf_refs  = sorted(set(
+        r for r in re.findall(r"\b[0-9][A-Z]{1,2}_\d{1,4}/20\d{2}\b", text)
+        if r != arret_id
+    ))
     lines = ["References de l arret " + arret_id + "\n"]
     if atf_refs:
         lines.append("ATF cites (" + str(len(atf_refs)) + ") :")
@@ -181,7 +267,8 @@ def get_references(arret_id):
         for r in tf_refs:
             if r in ARRETS_BY_ID:
                 a = ARRETS_BY_ID[r]
-                lines.append("- " + r + " - " + a.get("objet", "-") + " (" + a.get("decision", "-") + ") [base]")
+                lines.append("- " + r + " - " + a.get("objet","-") +
+                              " (" + a.get("decision","-") + ") [base]")
             else:
                 lines.append("- " + r)
     if not atf_refs and not tf_refs:
@@ -193,15 +280,16 @@ def get_arret_by_reference(reference):
     reference = reference.strip()
     if re.match(r"^[0-9][A-Z]{1,2}_\d{1,4}/20\d{2}$", reference):
         return get_fulltext(reference)
-    atf_match = re.match(r"ATF\s+(\d{2,3})\s+([IVX]+)\s+(\d+)", reference, re.IGNORECASE)
-    if atf_match:
-        vol, part, page = atf_match.groups()
-        url = "https://www.bger.ch/ext/eurospider/live/fr/php/clir/http/index.php?lang=fr&type=show_document&highlight_docid=atf:///" + vol + "/" + part + "/" + page
+    m = re.match(r"ATF\s+(\d{2,3})\s+([IVX]+)\s+(\d+)", reference, re.IGNORECASE)
+    if m:
+        vol, part, page = m.groups()
+        url = ("https://www.bger.ch/ext/eurospider/live/fr/php/clir/http/index.php"
+               f"?lang=fr&type=show_document&highlight_docid=atf:///{vol}/{part}/{page}")
         try:
-            resp = httpx.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"}, follow_redirects=True)
+            resp = httpx.get(url, timeout=20,
+                             headers={"User-Agent": "Mozilla/5.0"}, follow_redirects=True)
             soup = BeautifulSoup(resp.text, "html.parser")
-            for tag in soup(["script", "style", "nav", "header", "footer"]):
-                tag.decompose()
+            for tag in soup(["script","style","nav","header","footer"]): tag.decompose()
             lines = [l.rstrip() for l in soup.get_text(separator="\n").splitlines() if l.strip()]
             return reference + "\nURL : " + url + "\n" + "-"*60 + "\n\n" + "\n".join(lines)[:15000]
         except Exception as e:
@@ -210,30 +298,49 @@ def get_arret_by_reference(reference):
 
 
 def call_tool(name, args):
-    if name == "search_arrets": return search_arrets(**args)
-    elif name == "get_fulltext": return get_fulltext(**args)
-    elif name == "get_references": return get_references(**args)
+    if name == "search_arrets":          return search_arrets(**args)
+    elif name == "get_fulltext":         return get_fulltext(**args)
+    elif name == "get_references":       return get_references(**args)
     elif name == "get_arret_by_reference": return get_arret_by_reference(**args)
     return "Outil inconnu : " + name
 
 # ---------------------------------------------------------------------------
-# Handlers MCP Streamable HTTP
+# Handlers HTTP
 # ---------------------------------------------------------------------------
-def make_response(req_id, result):
-    return JSONResponse(
-        {"jsonrpc": "2.0", "id": req_id, "result": result},
-        headers={"Content-Type": "application/json"}
-    )
+def ok(req_id, result):
+    return JSONResponse({"jsonrpc":"2.0","id":req_id,"result":result},
+                        headers={"Content-Type":"application/json"})
 
-def make_error(req_id, code, message):
-    return JSONResponse(
-        {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}},
-        headers={"Content-Type": "application/json"}
-    )
+def err(req_id, code, msg):
+    return JSONResponse({"jsonrpc":"2.0","id":req_id,"error":{"code":code,"message":msg}},
+                        headers={"Content-Type":"application/json"})
+
+
+async def handle_health(request: Request):
+    return JSONResponse({
+        "status": "ok",
+        "name":   "iusprudentia-poenalis",
+        "arrets": len(ARRETS),
+        "version": "9.0"
+    })
+
+
+async def handle_reload(request: Request):
+    """Rechargement des données depuis Google Drive.
+    Appel : GET /reload?key=VOTRE_CLE
+    """
+    global ARRETS, ARRETS_BY_ID
+    key = request.query_params.get("key", "")
+    if key != RELOAD_KEY:
+        return JSONResponse({"error": "Clé invalide"}, status_code=403)
+    try:
+        ARRETS, ARRETS_BY_ID = load_from_gdrive()
+        return JSONResponse({"status": "ok", "arrets": len(ARRETS)})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 async def handle_mcp(request: Request):
-    # GET /mcp — retourne info serveur
     if request.method == "GET":
         return JSONResponse({
             "name": "iusprudentia-poenalis",
@@ -241,49 +348,42 @@ async def handle_mcp(request: Request):
             "protocolVersion": "2025-11-25"
         })
 
-    # DELETE /mcp — ferme une session
     if request.method == "DELETE":
-        session_id = request.headers.get("mcp-session-id")
-        if session_id and session_id in SESSIONS:
-            del SESSIONS[session_id]
+        sid = request.headers.get("mcp-session-id")
+        if sid and sid in SESSIONS:
+            del SESSIONS[sid]
         return Response(status_code=200)
 
-    # POST /mcp — traite les requêtes JSON-RPC
     try:
         data = await request.json()
     except Exception:
-        return make_error(None, -32700, "Parse error")
+        return err(None, -32700, "Parse error")
 
-    logger.info(f"POST /mcp method={data.get('method')} session={request.headers.get('mcp-session-id', 'none')}")
+    method  = data.get("method", "")
+    params  = data.get("params", {})
+    req_id  = data.get("id", 1)
 
-    method = data.get("method", "")
-    params = data.get("params", {})
-    req_id = data.get("id", 1)
-
-    # Gestion des sessions
-    session_id = request.headers.get("mcp-session-id")
+    logger.info(f"MCP {method} | session={request.headers.get('mcp-session-id','—')}")
 
     if method == "initialize":
-        # Créer nouvelle session
-        new_session_id = str(uuid.uuid4())
-        SESSIONS[new_session_id] = {"initialized": True}
-        result = {
+        sid = str(uuid.uuid4())
+        SESSIONS[sid] = True
+        resp = ok(req_id, {
             "protocolVersion": "2025-11-25",
-            "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": "iusprudentia-poenalis", "version": "1.0.0"}
-        }
-        response = make_response(req_id, result)
-        response.headers["mcp-session-id"] = new_session_id
-        return response
+            "capabilities":    {"tools": {"listChanged": False}},
+            "serverInfo":      {"name": "iusprudentia-poenalis", "version": "1.0.0"}
+        })
+        resp.headers["mcp-session-id"] = sid
+        return resp
 
     if method == "notifications/initialized":
         return Response(status_code=202)
 
     if method == "ping":
-        return make_response(req_id, {})
+        return ok(req_id, {})
 
     if method == "tools/list":
-        return make_response(req_id, {"tools": TOOLS})
+        return ok(req_id, {"tools": TOOLS})
 
     if method == "tools/call":
         tool = params.get("name", "")
@@ -292,18 +392,9 @@ async def handle_mcp(request: Request):
             result = call_tool(tool, args)
         except Exception as e:
             result = "Erreur : " + str(e)
-        return make_response(req_id, {"content": [{"type": "text", "text": result}]})
+        return ok(req_id, {"content": [{"type": "text", "text": result}]})
 
-    return make_error(req_id, -32601, "Method not found")
-
-
-async def handle_health(request: Request):
-    return JSONResponse({
-        "status": "ok",
-        "name": "iusprudentia-poenalis",
-        "arrets": len(ARRETS),
-        "version": "8.0"
-    })
+    return err(req_id, -32601, "Method not found")
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +404,7 @@ middleware = [
     Middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_methods=["GET","POST","DELETE","OPTIONS"],
         allow_headers=["*"],
         expose_headers=["mcp-session-id"]
     )
@@ -321,8 +412,9 @@ middleware = [
 
 app = Starlette(
     routes=[
-        Route("/", handle_health, methods=["GET", "HEAD"]),
-        Route("/mcp", handle_mcp, methods=["GET", "POST", "DELETE"]),
+        Route("/",       handle_health, methods=["GET","HEAD"]),
+        Route("/reload", handle_reload, methods=["GET"]),
+        Route("/mcp",    handle_mcp,    methods=["GET","POST","DELETE"]),
     ],
     middleware=middleware
 )
