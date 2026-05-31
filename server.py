@@ -1,4 +1,4 @@
-# Iusprudentia Poenalis - Serveur MCP v9
+# Criminomos - Serveur MCP v9
 # Chargement automatique depuis Google Drive + endpoint /reload
 import json
 import re
@@ -319,7 +319,7 @@ def err(req_id, code, msg):
 async def handle_health(request: Request):
     return JSONResponse({
         "status": "ok",
-        "name":   "iusprudentia-poenalis",
+        "name":   "criminomos",
         "arrets": len(ARRETS),
         "version": "9.0"
     })
@@ -343,7 +343,7 @@ async def handle_reload(request: Request):
 async def handle_mcp(request: Request):
     if request.method == "GET":
         return JSONResponse({
-            "name": "iusprudentia-poenalis",
+            "name": "criminomos",
             "version": "1.0.0",
             "protocolVersion": "2025-11-25"
         })
@@ -371,7 +371,7 @@ async def handle_mcp(request: Request):
         resp = ok(req_id, {
             "protocolVersion": "2025-11-25",
             "capabilities":    {"tools": {"listChanged": False}},
-            "serverInfo":      {"name": "iusprudentia-poenalis", "version": "1.0.0"}
+            "serverInfo":      {"name": "criminomos", "version": "1.0.0"}
         })
         resp.headers["mcp-session-id"] = sid
         return resp
