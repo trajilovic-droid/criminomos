@@ -1,5 +1,5 @@
-# Criminomos - Serveur MCP v10
-# Recherche multilingue + références profondes
+# Criminomos - Serveur MCP v12
+# Protection par token + journal d'accès + limite sessions simultanées
 import json
 import re
 import unicodedata
@@ -7,7 +7,10 @@ import os
 import uuid
 import logging
 import io
+import time
 from pathlib import Path
+from collections import defaultdict
+from datetime import datetime, timezone
 
 import httpx
 import pandas as pd
@@ -27,15 +30,80 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-GDRIVE_FILE_ID = os.environ.get("GDRIVE_FILE_ID", "18ylKTce78zSdEpeJ8tBbPchPIGs-kG4w")
-RELOAD_KEY     = os.environ.get("RELOAD_KEY", "iuris2026!")
-GDRIVE_URL     = f"https://docs.google.com/spreadsheets/d/{GDRIVE_FILE_ID}/export?format=xlsx"
+GDRIVE_FILE_ID   = os.environ.get("GDRIVE_FILE_ID", "18ylKTce78zSdEpeJ8tBbPchPIGs-kG4w")
+RELOAD_KEY       = os.environ.get("RELOAD_KEY", "iuris2026!")
+GDRIVE_URL       = f"https://docs.google.com/spreadsheets/d/{GDRIVE_FILE_ID}/export?format=xlsx"
+MAX_SESSIONS     = int(os.environ.get("MAX_SESSIONS_PER_TOKEN", "2"))
+MAX_LOG_ENTRIES  = 500  # Nombre max d'entrées dans le journal en mémoire
+
+def load_tokens():
+    raw = os.environ.get("ACCESS_TOKENS", "")
+    if not raw.strip():
+        return set()
+    return {t.strip() for t in raw.split(",") if t.strip()}
+
+ACCESS_TOKENS = load_tokens()
 
 # ---------------------------------------------------------------------------
-# Dictionnaire multilingue juridique pénal suisse (FR → DE/IT)
+# Journal d'accès (en mémoire)
+# ---------------------------------------------------------------------------
+ACCESS_LOG = []  # Liste de dicts {token, ip, action, timestamp}
+
+def log_access(token, ip, action):
+    entry = {
+        "token":     token,
+        "ip":        ip,
+        "action":    action,
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    }
+    ACCESS_LOG.append(entry)
+    if len(ACCESS_LOG) > MAX_LOG_ENTRIES:
+        ACCESS_LOG.pop(0)  # Supprimer la plus ancienne entrée
+    logger.info(f"ACCESS | token={token} | ip={ip} | action={action}")
+
+# Sessions actives par token : token -> set of session_ids
+TOKEN_SESSIONS = defaultdict(set)
+
+# ---------------------------------------------------------------------------
+# Authentification
+# ---------------------------------------------------------------------------
+def get_token(request: Request) -> str:
+    """Extrait le token de la requête."""
+    auth = request.headers.get("authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:].strip()
+    return request.headers.get("x-api-key", "").strip()
+
+def is_authorized(request: Request) -> tuple:
+    """
+    Retourne (autorisé, token, message).
+    """
+    if not ACCESS_TOKENS:
+        return True, "anonymous", "ok"
+
+    token = get_token(request)
+    if not token:
+        return False, "", "Token manquant — veuillez configurer votre clé d'accès"
+    if token not in ACCESS_TOKENS:
+        return False, token, "Token invalide"
+    return True, token, "ok"
+
+def check_concurrent_sessions(token: str, session_id: str) -> bool:
+    """
+    Vérifie si le token dépasse la limite de sessions simultanées.
+    Retourne True si autorisé.
+    """
+    sessions = TOKEN_SESSIONS[token]
+    if session_id in sessions:
+        return True  # Session déjà connue
+    if len(sessions) >= MAX_SESSIONS:
+        return False  # Trop de sessions simultanées
+    return True
+
+# ---------------------------------------------------------------------------
+# Dictionnaire multilingue
 # ---------------------------------------------------------------------------
 MULTILANG = {
-    # Infractions
     "expulsion": ["landesverweisung", "espulsione"],
     "viol": ["vergewaltigung", "violenza carnale"],
     "meurtre": ["mord", "omicidio"],
@@ -56,11 +124,9 @@ MULTILANG = {
     "instigation": ["anstiftung", "istigazione"],
     "récidive": ["rückfall", "recidiva"],
     "concours": ["konkurrenz", "concorso"],
-    # Procédure
     "détention provisoire": ["untersuchungshaft", "carcerazione preventiva"],
     "détention": ["haft", "detenzione"],
     "arrestation": ["verhaftung", "arresto"],
-    "mise en accusation": ["anklage", "accusa"],
     "ordonnance pénale": ["strafbefehl", "decreto d'accusa"],
     "classement": ["einstellung", "abbandono"],
     "non-entrée en matière": ["nichtanhandnahme", "non luogo a procedere"],
@@ -75,32 +141,25 @@ MULTILANG = {
     "perquisition": ["hausdurchsuchung", "perquisizione"],
     "surveillance": ["überwachung", "sorveglianza"],
     "expertise": ["gutachten", "perizia"],
-    # Peines
     "peine privative de liberté": ["freiheitsstrafe", "pena detentiva"],
     "peine pécuniaire": ["geldstrafe", "pena pecuniaria"],
-    "travail d'intérêt général": ["gemeinnützige arbeit", "lavoro di pubblica utilità"],
     "sursis": ["aufschub", "sospensione"],
     "libération conditionnelle": ["bedingte entlassung", "liberazione condizionale"],
     "internement": ["verwahrung", "internamento"],
     "mesure": ["massnahme", "misura"],
-    "expulsion": ["landesverweisung", "espulsione"],
-    # Notions générales
     "culpabilité": ["schuld", "colpevolezza"],
-    "dol": ["vorsatz", "dolo"],
     "négligence": ["fahrlässigkeit", "negligenza"],
     "causalité": ["kausalität", "causalità"],
     "prescription": ["verjährung", "prescrizione"],
     "légitime défense": ["notwehr", "legittima difesa"],
     "état de nécessité": ["notstand", "stato di necessità"],
     "victime": ["opfer", "vittima"],
-    "plaignant": ["geschädigte", "accusatore privato"],
     "prévenu": ["beschuldigte", "imputato"],
     "ministère public": ["staatsanwaltschaft", "ministero pubblico"],
 }
 
 def expand_query_multilang(query_words):
-    """Étend une liste de mots-clés avec leurs équivalents multilingues."""
-    expanded = list(query_words)
+    expanded    = list(query_words)
     query_lower = " ".join(query_words).lower()
     for fr_term, translations in MULTILANG.items():
         if fr_term in query_lower:
@@ -154,7 +213,7 @@ def parse_excel(content: bytes) -> list:
 
 
 def load_from_gdrive():
-    logger.info(f"Téléchargement depuis Google Drive...")
+    logger.info("Téléchargement depuis Google Drive...")
     resp = httpx.get(GDRIVE_URL, timeout=60, follow_redirects=True)
     resp.raise_for_status()
     data  = parse_excel(resp.content)
@@ -180,7 +239,7 @@ except Exception as e:
     logger.warning(f"Google Drive inaccessible ({e}), chargement local.")
     ARRETS, ARRETS_BY_ID = load_from_local()
 
-SESSIONS = {}
+SESSIONS = {}  # session_id -> token
 
 # ---------------------------------------------------------------------------
 # Outils MCP
@@ -188,18 +247,15 @@ SESSIONS = {}
 TOOLS = [
     {
         "name": "search_arrets",
-        "description": """Recherche des arrets du Tribunal federal suisse en droit penal.
-Recherche automatiquement dans les trois langues (FR/DE/IT) — si vous tapez 'expulsion',
-l'outil cherche aussi 'Landesverweisung' et 'espulsione' automatiquement.
-Utilisez cet outil en premier pour identifier les arrets pertinents.""",
+        "description": "Recherche des arrets du Tribunal federal suisse en droit penal. Recherche automatiquement dans les trois langues (FR/DE/IT).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query":      {"type": "string",  "description": "Mots-cles en francais, allemand ou italien"},
-                "infraction": {"type": "string",  "description": "Type d infraction ex: Expulsion, Viol"},
-                "article":    {"type": "string",  "description": "Article de loi ex: 66a CP, 190 CP"},
+                "infraction": {"type": "string",  "description": "Type d infraction ex: Expulsion"},
+                "article":    {"type": "string",  "description": "Article de loi ex: 66a CP"},
                 "annee":      {"type": "string",  "description": "Annee ex: 2024"},
-                "langue":     {"type": "string",  "description": "Langue de l arret : F, D ou I"},
+                "langue":     {"type": "string",  "description": "Langue : F, D ou I"},
                 "limite":     {"type": "integer", "description": "Nombre de resultats max 30"}
             },
             "required": ["query"]
@@ -207,7 +263,7 @@ Utilisez cet outil en premier pour identifier les arrets pertinents.""",
     },
     {
         "name": "get_fulltext",
-        "description": "Charge le texte integral d un arret depuis bger.ch. Utilise pour lire le raisonnement juridique complet.",
+        "description": "Charge le texte integral d un arret depuis bger.ch.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -229,15 +285,12 @@ Utilisez cet outil en premier pour identifier les arrets pertinents.""",
     },
     {
         "name": "get_references_deep",
-        "description": """Remonte les references sur 2 niveaux de profondeur.
-Charge l arret, extrait ses references (niveau 1), puis charge chaque reference
-et extrait ses propres references (niveau 2). Retourne un arbre complet des citations.
-Utilise pour une analyse approfondie de la jurisprudence de reference sur un sujet.""",
+        "description": "Remonte les references sur 2 niveaux de profondeur. Retourne un arbre complet des citations.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "arret_id": {"type": "string", "description": "Numero d arret de depart ex: 6B_409/2024"},
-                "max_refs":  {"type": "integer", "description": "Nombre max de references niveau 1 a explorer (defaut 5, max 10)"}
+                "arret_id": {"type": "string",  "description": "Numero d arret de depart"},
+                "max_refs": {"type": "integer", "description": "Nombre max de refs niveau 1 a explorer (defaut 5, max 10)"}
             },
             "required": ["arret_id"]
         }
@@ -280,11 +333,8 @@ def score_arret(arret, query_words):
 def search_arrets(query="", infraction="", article="", annee="", langue="", limite=10):
     limite      = min(int(limite), 30)
     query_words = query.strip().split() if query.strip() else []
-
-    # Expansion multilingue automatique
-    expanded_words = expand_query_multilang(query_words)
-
-    results = []
+    expanded    = expand_query_multilang(query_words)
+    results     = []
     for arret in ARRETS:
         if infraction and not normalize(arret.get("objet", "")).startswith(normalize(infraction)):
             continue
@@ -295,22 +345,16 @@ def search_arrets(query="", infraction="", article="", annee="", langue="", limi
             continue
         if langue and arret.get("langue", "").upper() != langue.upper():
             continue
-        score = score_arret(arret, expanded_words) if expanded_words else 1
+        score = score_arret(arret, expanded) if expanded else 1
         if score > 0 or not query_words:
             results.append((score, arret))
-
     results.sort(key=lambda x: x[0], reverse=True)
     results = results[:limite]
     if not results:
         return "Aucun arret trouve."
-
-    # Indiquer les termes multilingues utilisés
-    extra_terms = [w for w in expanded_words if w not in query_words]
-    header = ""
-    if extra_terms:
-        header = "Recherche etendue aux equivalents : " + ", ".join(extra_terms) + "\n\n"
-
-    lines = [header + str(len(results)) + " arret(s) trouve(s)\n"]
+    extra  = [w for w in expanded if w not in query_words]
+    header = ("Recherche etendue aux equivalents : " + ", ".join(extra) + "\n\n") if extra else ""
+    lines  = [header + str(len(results)) + " arret(s) trouve(s)\n"]
     for _, r in results:
         lines.append("### " + r["arret"])
         lines.append("- Objet : "    + r.get("objet",    "-"))
@@ -387,65 +431,44 @@ def get_references(arret_id):
 
 
 def get_references_deep(arret_id, max_refs=5):
-    """Remonte les références sur 2 niveaux."""
     max_refs = min(int(max_refs), 10)
-    url = _arret_url(arret_id)
-    lines = ["=== REFERENCES PROFONDES : " + arret_id + " ===\n"]
-
-    # Niveau 1
+    url      = _arret_url(arret_id)
+    lines    = ["=== REFERENCES PROFONDES : " + arret_id + " ===\n"]
     try:
         text1 = _fetch_text(url)
     except Exception as e:
-        return "Erreur chargement arrêt principal : " + str(e)
-
+        return "Erreur : " + str(e)
     atf1, tf1 = _extract_refs(text1, arret_id)
     lines.append("NIVEAU 1 — References directes")
-    lines.append("ATF cites : " + (", ".join(atf1) if atf1 else "aucun"))
-    lines.append("Arrets TF cites : " + (", ".join(tf1[:20]) if tf1 else "aucun"))
+    lines.append("ATF cites : "       + (", ".join(atf1)      if atf1      else "aucun"))
+    lines.append("Arrets TF cites : " + (", ".join(tf1[:20])  if tf1       else "aucun"))
     lines.append("")
-
-    # Niveau 2 — explorer les premières références TF
-    refs_to_explore = tf1[:max_refs]
-    if refs_to_explore:
-        lines.append("NIVEAU 2 — References des references (top " + str(len(refs_to_explore)) + ")")
-        for ref_id in refs_to_explore:
-            ref_url = _arret_url(ref_id)
+    for ref_id in tf1[:max_refs]:
+        try:
+            text2     = _fetch_text(_arret_url(ref_id))
+            atf2, tf2 = _extract_refs(text2, ref_id)
+            meta      = ARRETS_BY_ID.get(ref_id)
+            objet     = meta.get("objet", "—") if meta else "hors base"
+            lines.append("\n  " + ref_id + " (" + objet + ")")
+            if atf2: lines.append("  ATF cites : "       + ", ".join(atf2[:5]))
+            if tf2:  lines.append("  Arrets TF cites : " + ", ".join(tf2[:5]))
+            if not atf2 and not tf2: lines.append("  (aucune reference)")
+        except Exception as e:
+            lines.append("\n  " + ref_id + " — Erreur : " + str(e))
+    for atf_ref in atf1[:3]:
+        m = re.match(r"ATF\s+(\d{2,3})\s+([IVX]+)\s+(\d+)", atf_ref)
+        if m:
+            vol, part, page = m.groups()
+            atf_url = ("https://www.bger.ch/ext/eurospider/live/fr/php/clir/http/index.php"
+                       f"?lang=fr&type=show_document&highlight_docid=atf:///{vol}/{part}/{page}")
             try:
-                text2 = _fetch_text(ref_url)
-                atf2, tf2 = _extract_refs(text2, ref_id)
-                meta = ARRETS_BY_ID.get(ref_id)
-                objet = meta.get("objet", "—") if meta else "hors base"
-                lines.append("\n  " + ref_id + " (" + objet + ")")
-                if atf2:
-                    lines.append("  ATF cites : " + ", ".join(atf2[:5]))
-                if tf2:
-                    lines.append("  Arrets TF cites : " + ", ".join(tf2[:5]))
-                if not atf2 and not tf2:
-                    lines.append("  (aucune reference trouvee)")
+                text_atf  = _fetch_text(atf_url)
+                atf2, tf2 = _extract_refs(text_atf, "")
+                lines.append("\n  " + atf_ref)
+                if atf2: lines.append("  ATF cites : "       + ", ".join(atf2[:5]))
+                if tf2:  lines.append("  Arrets TF cites : " + ", ".join(tf2[:5]))
             except Exception as e:
-                lines.append("\n  " + ref_id + " — Erreur : " + str(e))
-
-    # Niveau 2 — explorer les premiers ATF
-    atf_to_explore = atf1[:3]
-    if atf_to_explore:
-        lines.append("\nNIVEAU 2 — References des ATF cites (top 3)")
-        for atf_ref in atf_to_explore:
-            m = re.match(r"ATF\s+(\d{2,3})\s+([IVX]+)\s+(\d+)", atf_ref)
-            if m:
-                vol, part, page = m.groups()
-                atf_url = ("https://www.bger.ch/ext/eurospider/live/fr/php/clir/http/index.php"
-                           f"?lang=fr&type=show_document&highlight_docid=atf:///{vol}/{part}/{page}")
-                try:
-                    text_atf = _fetch_text(atf_url)
-                    atf2, tf2 = _extract_refs(text_atf, "")
-                    lines.append("\n  " + atf_ref)
-                    if atf2:
-                        lines.append("  ATF cites : " + ", ".join(atf2[:5]))
-                    if tf2:
-                        lines.append("  Arrets TF cites : " + ", ".join(tf2[:5]))
-                except Exception as e:
-                    lines.append("\n  " + atf_ref + " — Erreur : " + str(e))
-
+                lines.append("\n  " + atf_ref + " — Erreur : " + str(e))
     return "\n".join(lines)
 
 
@@ -488,10 +511,12 @@ def err(req_id, code, msg):
 
 async def handle_health(request: Request):
     return JSONResponse({
-        "status":  "ok",
-        "name":    "criminomos",
-        "arrets":  len(ARRETS),
-        "version": "10.0"
+        "status":   "ok",
+        "name":     "criminomos",
+        "arrets":   len(ARRETS),
+        "version":  "12.0",
+        "auth":     "enabled" if ACCESS_TOKENS else "disabled",
+        "sessions": {t: len(s) for t, s in TOKEN_SESSIONS.items()}
     })
 
 
@@ -507,19 +532,65 @@ async def handle_reload(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+async def handle_log(request: Request):
+    """Journal d'accès — accessible uniquement avec la clé RELOAD_KEY."""
+    key = request.query_params.get("key", "")
+    if key != RELOAD_KEY:
+        return JSONResponse({"error": "Clé invalide"}, status_code=403)
+    token_filter = request.query_params.get("token", "")
+    logs = ACCESS_LOG if not token_filter else [e for e in ACCESS_LOG if e["token"] == token_filter]
+    return JSONResponse({
+        "total":   len(logs),
+        "entries": list(reversed(logs[-100:]))  # 100 dernières entrées, plus récentes en premier
+    })
+
+
+async def handle_sessions(request: Request):
+    """Sessions actives — accessible uniquement avec la clé RELOAD_KEY."""
+    key = request.query_params.get("key", "")
+    if key != RELOAD_KEY:
+        return JSONResponse({"error": "Clé invalide"}, status_code=403)
+    return JSONResponse({
+        "max_per_token": MAX_SESSIONS,
+        "active": {t: list(s) for t, s in TOKEN_SESSIONS.items()}
+    })
+
+
+async def handle_revoke(request: Request):
+    """Révocation des sessions d'un token."""
+    key   = request.query_params.get("key", "")
+    token = request.query_params.get("token", "")
+    if key != RELOAD_KEY:
+        return JSONResponse({"error": "Clé invalide"}, status_code=403)
+    if not token:
+        return JSONResponse({"error": "Token manquant"}, status_code=400)
+    count = len(TOKEN_SESSIONS.get(token, set()))
+    TOKEN_SESSIONS[token] = set()
+    log_access(token, request.client.host if request.client else "unknown", "revoked_by_admin")
+    return JSONResponse({"status": "ok", "token": token, "sessions_revoked": count})
+
+
 async def handle_mcp(request: Request):
     if request.method == "GET":
         return JSONResponse({
-            "name": "criminomos",
-            "version": "10.0",
+            "name":            "criminomos",
+            "version":         "12.0",
             "protocolVersion": "2025-11-25"
         })
 
     if request.method == "DELETE":
-        sid = request.headers.get("mcp-session-id")
-        if sid and sid in SESSIONS:
-            del SESSIONS[sid]
+        sid   = request.headers.get("mcp-session-id")
+        token = SESSIONS.pop(sid, None) if sid else None
+        if token and sid:
+            TOKEN_SESSIONS[token].discard(sid)
+            log_access(token, request.client.host if request.client else "unknown", "disconnect")
         return Response(status_code=200)
+
+    # Vérification du token
+    authorized, token, msg = is_authorized(request)
+    if not authorized:
+        log_access(token or "unknown", request.client.host if request.client else "unknown", "denied:" + msg)
+        return JSONResponse({"error": msg}, status_code=401)
 
     try:
         data = await request.json()
@@ -530,15 +601,27 @@ async def handle_mcp(request: Request):
     params = data.get("params", {})
     req_id = data.get("id", 1)
 
-    logger.info(f"MCP {method}")
+    ip = request.client.host if request.client else "unknown"
 
     if method == "initialize":
         sid = str(uuid.uuid4())
-        SESSIONS[sid] = True
+
+        # Vérifier la limite de sessions simultanées
+        if not check_concurrent_sessions(token, sid):
+            log_access(token, ip, "blocked:max_sessions")
+            return JSONResponse(
+                {"error": f"Limite de {MAX_SESSIONS} session(s) simultanée(s) atteinte pour ce token. Vérifiez que votre token n'est pas partagé."},
+                status_code=429
+            )
+
+        SESSIONS[sid]             = token
+        TOKEN_SESSIONS[token].add(sid)
+        log_access(token, ip, "connect")
+
         resp = ok(req_id, {
             "protocolVersion": "2025-11-25",
             "capabilities":    {"tools": {"listChanged": False}},
-            "serverInfo":      {"name": "criminomos", "version": "10.0"}
+            "serverInfo":      {"name": "criminomos", "version": "12.0"}
         })
         resp.headers["mcp-session-id"] = sid
         return resp
@@ -550,11 +633,13 @@ async def handle_mcp(request: Request):
         return ok(req_id, {})
 
     if method == "tools/list":
+        log_access(token, ip, "tools/list")
         return ok(req_id, {"tools": TOOLS})
 
     if method == "tools/call":
         tool = params.get("name", "")
         args = params.get("arguments", {})
+        log_access(token, ip, "call:" + tool)
         try:
             result = call_tool(tool, args)
         except Exception as e:
@@ -579,9 +664,12 @@ middleware = [
 
 app = Starlette(
     routes=[
-        Route("/",       handle_health, methods=["GET", "HEAD"]),
-        Route("/reload", handle_reload, methods=["GET"]),
-        Route("/mcp",    handle_mcp,    methods=["GET", "POST", "DELETE"]),
+        Route("/",        handle_health,   methods=["GET", "HEAD"]),
+        Route("/reload",  handle_reload,   methods=["GET"]),
+        Route("/log",     handle_log,      methods=["GET"]),
+        Route("/sessions",handle_sessions, methods=["GET"]),
+        Route("/revoke",  handle_revoke,   methods=["GET"]),
+        Route("/mcp",     handle_mcp,      methods=["GET", "POST", "DELETE"]),
     ],
     middleware=middleware
 )
