@@ -1,5 +1,5 @@
-# Criminomos - Serveur MCP v9
-# Chargement automatique depuis Google Drive + endpoint /reload
+# Criminomos - Serveur MCP v10
+# Recherche multilingue + références profondes
 import json
 import re
 import unicodedata
@@ -28,17 +28,91 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 GDRIVE_FILE_ID = os.environ.get("GDRIVE_FILE_ID", "18ylKTce78zSdEpeJ8tBbPchPIGs-kG4w")
-RELOAD_KEY     = os.environ.get("RELOAD_KEY", "iuris2026")
+RELOAD_KEY     = os.environ.get("RELOAD_KEY", "iuris2026!")
 GDRIVE_URL     = f"https://docs.google.com/spreadsheets/d/{GDRIVE_FILE_ID}/export?format=xlsx"
 
 # ---------------------------------------------------------------------------
-# Chargement et conversion Excel → liste de dicts
+# Dictionnaire multilingue juridique pénal suisse (FR → DE/IT)
+# ---------------------------------------------------------------------------
+MULTILANG = {
+    # Infractions
+    "expulsion": ["landesverweisung", "espulsione"],
+    "viol": ["vergewaltigung", "violenza carnale"],
+    "meurtre": ["mord", "omicidio"],
+    "homicide": ["tötung", "omicidio"],
+    "lésions corporelles": ["körperverletzung", "lesioni corporali"],
+    "escroquerie": ["betrug", "truffa"],
+    "abus de confiance": ["veruntreuung", "appropriazione indebita"],
+    "contrainte": ["nötigung", "coazione"],
+    "menaces": ["drohung", "minaccia"],
+    "brigandage": ["raub", "rapina"],
+    "vol": ["diebstahl", "furto"],
+    "faux": ["urkundenfälschung", "falsità in documenti"],
+    "diffamation": ["verleumdung", "diffamazione"],
+    "injure": ["beschimpfung", "ingiuria"],
+    "incendie": ["brandstiftung", "incendio"],
+    "tentative": ["versuch", "tentativo"],
+    "complicité": ["gehilfenschaft", "complicità"],
+    "instigation": ["anstiftung", "istigazione"],
+    "récidive": ["rückfall", "recidiva"],
+    "concours": ["konkurrenz", "concorso"],
+    # Procédure
+    "détention provisoire": ["untersuchungshaft", "carcerazione preventiva"],
+    "détention": ["haft", "detenzione"],
+    "arrestation": ["verhaftung", "arresto"],
+    "mise en accusation": ["anklage", "accusa"],
+    "ordonnance pénale": ["strafbefehl", "decreto d'accusa"],
+    "classement": ["einstellung", "abbandono"],
+    "non-entrée en matière": ["nichtanhandnahme", "non luogo a procedere"],
+    "acquittement": ["freispruch", "assoluzione"],
+    "condamnation": ["verurteilung", "condanna"],
+    "appel": ["berufung", "appello"],
+    "recours": ["beschwerde", "ricorso"],
+    "révision": ["revision", "revisione"],
+    "récusation": ["ausstand", "ricusazione"],
+    "scellés": ["siegelung", "sigillazione"],
+    "séquestre": ["beschlagnahme", "sequestro"],
+    "perquisition": ["hausdurchsuchung", "perquisizione"],
+    "surveillance": ["überwachung", "sorveglianza"],
+    "expertise": ["gutachten", "perizia"],
+    # Peines
+    "peine privative de liberté": ["freiheitsstrafe", "pena detentiva"],
+    "peine pécuniaire": ["geldstrafe", "pena pecuniaria"],
+    "travail d'intérêt général": ["gemeinnützige arbeit", "lavoro di pubblica utilità"],
+    "sursis": ["aufschub", "sospensione"],
+    "libération conditionnelle": ["bedingte entlassung", "liberazione condizionale"],
+    "internement": ["verwahrung", "internamento"],
+    "mesure": ["massnahme", "misura"],
+    "expulsion": ["landesverweisung", "espulsione"],
+    # Notions générales
+    "culpabilité": ["schuld", "colpevolezza"],
+    "dol": ["vorsatz", "dolo"],
+    "négligence": ["fahrlässigkeit", "negligenza"],
+    "causalité": ["kausalität", "causalità"],
+    "prescription": ["verjährung", "prescrizione"],
+    "légitime défense": ["notwehr", "legittima difesa"],
+    "état de nécessité": ["notstand", "stato di necessità"],
+    "victime": ["opfer", "vittima"],
+    "plaignant": ["geschädigte", "accusatore privato"],
+    "prévenu": ["beschuldigte", "imputato"],
+    "ministère public": ["staatsanwaltschaft", "ministero pubblico"],
+}
+
+def expand_query_multilang(query_words):
+    """Étend une liste de mots-clés avec leurs équivalents multilingues."""
+    expanded = list(query_words)
+    query_lower = " ".join(query_words).lower()
+    for fr_term, translations in MULTILANG.items():
+        if fr_term in query_lower:
+            expanded.extend(translations)
+    return expanded
+
+# ---------------------------------------------------------------------------
+# Chargement des données
 # ---------------------------------------------------------------------------
 def parse_excel(content: bytes) -> list:
     sheets = pd.read_excel(io.BytesIO(content), sheet_name=None)
     wb     = load_workbook(io.BytesIO(content))
-
-    # Extraire les hyperliens
     url_map = {}
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
@@ -46,7 +120,6 @@ def parse_excel(content: bytes) -> list:
             for cell in row:
                 if cell.hyperlink and cell.value:
                     url_map[str(cell.value).strip()] = cell.hyperlink.target
-
     all_rows = []
     for sheet_name, df in sheets.items():
         if sheet_name == "2021-2024":
@@ -59,7 +132,6 @@ def parse_excel(content: bytes) -> list:
                 if pd.notna(val):
                     r[str(col).strip()] = str(val)
             all_rows.append(r)
-
     trimmed = []
     for r in all_rows:
         arret    = r.get("Arrêt", "").strip()
@@ -78,39 +150,36 @@ def parse_excel(content: bytes) -> list:
             "peine":    r.get("Peine prononcée", ""),
             "url":      url_map.get(arret, ""),
         })
-
     return [r for r in trimmed if r["arret"]]
 
 
-def load_from_gdrive() -> tuple:
-    logger.info(f"Téléchargement depuis Google Drive : {GDRIVE_URL}")
+def load_from_gdrive():
+    logger.info(f"Téléchargement depuis Google Drive...")
     resp = httpx.get(GDRIVE_URL, timeout=60, follow_redirects=True)
     resp.raise_for_status()
-    data = parse_excel(resp.content)
+    data  = parse_excel(resp.content)
     by_id = {r["arret"]: r for r in data}
-    logger.info(f"=== {len(data)} arrêts chargés depuis Google Drive ===")
+    logger.info(f"=== {len(data)} arrêts chargés ===")
     return data, by_id
 
 
-def load_from_local() -> tuple:
+def load_from_local():
     local = Path(__file__).parent / "arrets.json"
     if local.exists():
         with open(local, encoding="utf-8") as f:
             data = json.load(f)
         by_id = {r["arret"]: r for r in data if r.get("arret")}
-        logger.info(f"=== {len(data)} arrêts chargés depuis arrets.json (local) ===")
+        logger.info(f"=== {len(data)} arrêts chargés (local) ===")
         return data, by_id
     return [], {}
 
 
-# Chargement initial
 try:
     ARRETS, ARRETS_BY_ID = load_from_gdrive()
 except Exception as e:
     logger.warning(f"Google Drive inaccessible ({e}), chargement local.")
     ARRETS, ARRETS_BY_ID = load_from_local()
 
-# Sessions actives
 SESSIONS = {}
 
 # ---------------------------------------------------------------------------
@@ -119,14 +188,18 @@ SESSIONS = {}
 TOOLS = [
     {
         "name": "search_arrets",
-        "description": "Recherche des arrets du Tribunal federal suisse en droit penal par mots-cles, infraction ou article de loi.",
+        "description": """Recherche des arrets du Tribunal federal suisse en droit penal.
+Recherche automatiquement dans les trois langues (FR/DE/IT) — si vous tapez 'expulsion',
+l'outil cherche aussi 'Landesverweisung' et 'espulsione' automatiquement.
+Utilisez cet outil en premier pour identifier les arrets pertinents.""",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query":      {"type": "string",  "description": "Mots-cles de recherche"},
-                "infraction": {"type": "string",  "description": "Type d infraction ex: Expulsion"},
-                "article":    {"type": "string",  "description": "Article de loi ex: 66a CP"},
+                "query":      {"type": "string",  "description": "Mots-cles en francais, allemand ou italien"},
+                "infraction": {"type": "string",  "description": "Type d infraction ex: Expulsion, Viol"},
+                "article":    {"type": "string",  "description": "Article de loi ex: 66a CP, 190 CP"},
                 "annee":      {"type": "string",  "description": "Annee ex: 2024"},
+                "langue":     {"type": "string",  "description": "Langue de l arret : F, D ou I"},
                 "limite":     {"type": "integer", "description": "Nombre de resultats max 30"}
             },
             "required": ["query"]
@@ -134,7 +207,7 @@ TOOLS = [
     },
     {
         "name": "get_fulltext",
-        "description": "Charge le texte integral d un arret depuis bger.ch.",
+        "description": "Charge le texte integral d un arret depuis bger.ch. Utilise pour lire le raisonnement juridique complet.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -145,11 +218,26 @@ TOOLS = [
     },
     {
         "name": "get_references",
-        "description": "Extrait les ATF et arrets TF cites dans un arret.",
+        "description": "Extrait les ATF et arrets TF cites dans un arret (niveau 1).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "arret_id": {"type": "string", "description": "Numero d arret ex: 6B_409/2024"}
+            },
+            "required": ["arret_id"]
+        }
+    },
+    {
+        "name": "get_references_deep",
+        "description": """Remonte les references sur 2 niveaux de profondeur.
+Charge l arret, extrait ses references (niveau 1), puis charge chaque reference
+et extrait ses propres references (niveau 2). Retourne un arbre complet des citations.
+Utilise pour une analyse approfondie de la jurisprudence de reference sur un sujet.""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "arret_id": {"type": "string", "description": "Numero d arret de depart ex: 6B_409/2024"},
+                "max_refs":  {"type": "integer", "description": "Nombre max de references niveau 1 a explorer (defaut 5, max 10)"}
             },
             "required": ["arret_id"]
         }
@@ -189,10 +277,14 @@ def score_arret(arret, query_words):
     return score
 
 
-def search_arrets(query="", infraction="", article="", annee="", limite=10):
+def search_arrets(query="", infraction="", article="", annee="", langue="", limite=10):
     limite      = min(int(limite), 30)
     query_words = query.strip().split() if query.strip() else []
-    results     = []
+
+    # Expansion multilingue automatique
+    expanded_words = expand_query_multilang(query_words)
+
+    results = []
     for arret in ARRETS:
         if infraction and not normalize(arret.get("objet", "")).startswith(normalize(infraction)):
             continue
@@ -201,18 +293,29 @@ def search_arrets(query="", infraction="", article="", annee="", limite=10):
         if annee and not (arret.get("decision", "").startswith(annee) or
                           arret.get("parution",  "").startswith(annee)):
             continue
-        score = score_arret(arret, query_words) if query_words else 1
+        if langue and arret.get("langue", "").upper() != langue.upper():
+            continue
+        score = score_arret(arret, expanded_words) if expanded_words else 1
         if score > 0 or not query_words:
             results.append((score, arret))
+
     results.sort(key=lambda x: x[0], reverse=True)
     results = results[:limite]
     if not results:
         return "Aucun arret trouve."
-    lines = [str(len(results)) + " arret(s) trouve(s)\n"]
+
+    # Indiquer les termes multilingues utilisés
+    extra_terms = [w for w in expanded_words if w not in query_words]
+    header = ""
+    if extra_terms:
+        header = "Recherche etendue aux equivalents : " + ", ".join(extra_terms) + "\n\n"
+
+    lines = [header + str(len(results)) + " arret(s) trouve(s)\n"]
     for _, r in results:
         lines.append("### " + r["arret"])
         lines.append("- Objet : "    + r.get("objet",    "-"))
         lines.append("- Date : "     + r.get("decision", "-"))
+        lines.append("- Langue : "   + r.get("langue",   "-"))
         lines.append("- Articles : " + r.get("articles", "-"))
         if r.get("admis"):             lines.append("- Resultat : " + r["admis"])
         if r.get("interet") == "oui": lines.append("- Arret d interet")
@@ -222,42 +325,49 @@ def search_arrets(query="", infraction="", article="", annee="", limite=10):
     return "\n".join(lines)
 
 
-def get_fulltext(arret_id):
-    arret = ARRETS_BY_ID.get(arret_id)
-    url   = arret.get("url") if arret else None
-    if not url:
-        cid = re.sub(r"[^A-Za-z0-9_/.-]", "", arret_id)[:40]
-        url = ("https://www.bger.ch/ext/eurospider/live/fr/php/aza/http/index.php"
-               f"?lang=fr&type=show_document&highlight_docid=aza://{cid}")
-    try:
-        resp = httpx.get(url, timeout=20,
-                         headers={"User-Agent": "Mozilla/5.0"}, follow_redirects=True)
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for tag in soup(["script","style","nav","header","footer"]): tag.decompose()
-        lines = [l.rstrip() for l in soup.get_text(separator="\n").splitlines() if l.strip()]
-        return "Arret " + arret_id + "\nURL : " + url + "\n" + "-"*60 + "\n\n" + "\n".join(lines)[:15000]
-    except Exception as e:
-        return "Erreur : " + str(e)
+def _fetch_text(url):
+    resp = httpx.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"}, follow_redirects=True)
+    soup = BeautifulSoup(resp.text, "html.parser")
+    for tag in soup(["script", "style", "nav", "header", "footer"]):
+        tag.decompose()
+    lines = [l.rstrip() for l in soup.get_text(separator="\n").splitlines() if l.strip()]
+    return "\n".join(lines)
 
 
-def get_references(arret_id):
-    arret = ARRETS_BY_ID.get(arret_id)
-    url   = arret.get("url") if arret else None
-    if not url:
-        cid = re.sub(r"[^A-Za-z0-9_/.-]", "", arret_id)[:40]
-        url = ("https://www.bger.ch/ext/eurospider/live/fr/php/aza/http/index.php"
-               f"?lang=fr&type=show_document&highlight_docid=aza://{cid}")
-    try:
-        resp = httpx.get(url, timeout=20,
-                         headers={"User-Agent": "Mozilla/5.0"}, follow_redirects=True)
-        text = BeautifulSoup(resp.text, "html.parser").get_text(separator=" ")
-    except Exception as e:
-        return "Erreur : " + str(e)
+def _extract_refs(text, arret_id=""):
     atf_refs = sorted(set(re.findall(r"ATF\s+\d{2,3}\s+[IVX]+\s+\d+", text)))
     tf_refs  = sorted(set(
         r for r in re.findall(r"\b[0-9][A-Z]{1,2}_\d{1,4}/20\d{2}\b", text)
         if r != arret_id
     ))
+    return atf_refs, tf_refs
+
+
+def _arret_url(arret_id):
+    arret = ARRETS_BY_ID.get(arret_id)
+    if arret and arret.get("url"):
+        return arret["url"]
+    cid = re.sub(r"[^A-Za-z0-9_/.-]", "", arret_id)[:40]
+    return ("https://www.bger.ch/ext/eurospider/live/fr/php/aza/http/index.php"
+            f"?lang=fr&type=show_document&highlight_docid=aza://{cid}")
+
+
+def get_fulltext(arret_id):
+    url = _arret_url(arret_id)
+    try:
+        text = _fetch_text(url)
+        return "Arret " + arret_id + "\nURL : " + url + "\n" + "-"*60 + "\n\n" + text[:15000]
+    except Exception as e:
+        return "Erreur : " + str(e)
+
+
+def get_references(arret_id):
+    url = _arret_url(arret_id)
+    try:
+        text = _fetch_text(url)
+    except Exception as e:
+        return "Erreur : " + str(e)
+    atf_refs, tf_refs = _extract_refs(text, arret_id)
     lines = ["References de l arret " + arret_id + "\n"]
     if atf_refs:
         lines.append("ATF cites (" + str(len(atf_refs)) + ") :")
@@ -267,12 +377,75 @@ def get_references(arret_id):
         for r in tf_refs:
             if r in ARRETS_BY_ID:
                 a = ARRETS_BY_ID[r]
-                lines.append("- " + r + " - " + a.get("objet","-") +
-                              " (" + a.get("decision","-") + ") [base]")
+                lines.append("- " + r + " - " + a.get("objet", "-") +
+                              " (" + a.get("decision", "-") + ") [base]")
             else:
                 lines.append("- " + r)
     if not atf_refs and not tf_refs:
         lines.append("Aucune reference trouvee.")
+    return "\n".join(lines)
+
+
+def get_references_deep(arret_id, max_refs=5):
+    """Remonte les références sur 2 niveaux."""
+    max_refs = min(int(max_refs), 10)
+    url = _arret_url(arret_id)
+    lines = ["=== REFERENCES PROFONDES : " + arret_id + " ===\n"]
+
+    # Niveau 1
+    try:
+        text1 = _fetch_text(url)
+    except Exception as e:
+        return "Erreur chargement arrêt principal : " + str(e)
+
+    atf1, tf1 = _extract_refs(text1, arret_id)
+    lines.append("NIVEAU 1 — References directes")
+    lines.append("ATF cites : " + (", ".join(atf1) if atf1 else "aucun"))
+    lines.append("Arrets TF cites : " + (", ".join(tf1[:20]) if tf1 else "aucun"))
+    lines.append("")
+
+    # Niveau 2 — explorer les premières références TF
+    refs_to_explore = tf1[:max_refs]
+    if refs_to_explore:
+        lines.append("NIVEAU 2 — References des references (top " + str(len(refs_to_explore)) + ")")
+        for ref_id in refs_to_explore:
+            ref_url = _arret_url(ref_id)
+            try:
+                text2 = _fetch_text(ref_url)
+                atf2, tf2 = _extract_refs(text2, ref_id)
+                meta = ARRETS_BY_ID.get(ref_id)
+                objet = meta.get("objet", "—") if meta else "hors base"
+                lines.append("\n  " + ref_id + " (" + objet + ")")
+                if atf2:
+                    lines.append("  ATF cites : " + ", ".join(atf2[:5]))
+                if tf2:
+                    lines.append("  Arrets TF cites : " + ", ".join(tf2[:5]))
+                if not atf2 and not tf2:
+                    lines.append("  (aucune reference trouvee)")
+            except Exception as e:
+                lines.append("\n  " + ref_id + " — Erreur : " + str(e))
+
+    # Niveau 2 — explorer les premiers ATF
+    atf_to_explore = atf1[:3]
+    if atf_to_explore:
+        lines.append("\nNIVEAU 2 — References des ATF cites (top 3)")
+        for atf_ref in atf_to_explore:
+            m = re.match(r"ATF\s+(\d{2,3})\s+([IVX]+)\s+(\d+)", atf_ref)
+            if m:
+                vol, part, page = m.groups()
+                atf_url = ("https://www.bger.ch/ext/eurospider/live/fr/php/clir/http/index.php"
+                           f"?lang=fr&type=show_document&highlight_docid=atf:///{vol}/{part}/{page}")
+                try:
+                    text_atf = _fetch_text(atf_url)
+                    atf2, tf2 = _extract_refs(text_atf, "")
+                    lines.append("\n  " + atf_ref)
+                    if atf2:
+                        lines.append("  ATF cites : " + ", ".join(atf2[:5]))
+                    if tf2:
+                        lines.append("  Arrets TF cites : " + ", ".join(tf2[:5]))
+                except Exception as e:
+                    lines.append("\n  " + atf_ref + " — Erreur : " + str(e))
+
     return "\n".join(lines)
 
 
@@ -286,21 +459,18 @@ def get_arret_by_reference(reference):
         url = ("https://www.bger.ch/ext/eurospider/live/fr/php/clir/http/index.php"
                f"?lang=fr&type=show_document&highlight_docid=atf:///{vol}/{part}/{page}")
         try:
-            resp = httpx.get(url, timeout=20,
-                             headers={"User-Agent": "Mozilla/5.0"}, follow_redirects=True)
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for tag in soup(["script","style","nav","header","footer"]): tag.decompose()
-            lines = [l.rstrip() for l in soup.get_text(separator="\n").splitlines() if l.strip()]
-            return reference + "\nURL : " + url + "\n" + "-"*60 + "\n\n" + "\n".join(lines)[:15000]
+            text = _fetch_text(url)
+            return reference + "\nURL : " + url + "\n" + "-"*60 + "\n\n" + text[:15000]
         except Exception as e:
             return "Erreur : " + str(e)
     return "Format non reconnu : " + reference
 
 
 def call_tool(name, args):
-    if name == "search_arrets":          return search_arrets(**args)
-    elif name == "get_fulltext":         return get_fulltext(**args)
-    elif name == "get_references":       return get_references(**args)
+    if name == "search_arrets":            return search_arrets(**args)
+    elif name == "get_fulltext":           return get_fulltext(**args)
+    elif name == "get_references":         return get_references(**args)
+    elif name == "get_references_deep":    return get_references_deep(**args)
     elif name == "get_arret_by_reference": return get_arret_by_reference(**args)
     return "Outil inconnu : " + name
 
@@ -308,27 +478,24 @@ def call_tool(name, args):
 # Handlers HTTP
 # ---------------------------------------------------------------------------
 def ok(req_id, result):
-    return JSONResponse({"jsonrpc":"2.0","id":req_id,"result":result},
-                        headers={"Content-Type":"application/json"})
+    return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": result},
+                        headers={"Content-Type": "application/json"})
 
 def err(req_id, code, msg):
-    return JSONResponse({"jsonrpc":"2.0","id":req_id,"error":{"code":code,"message":msg}},
-                        headers={"Content-Type":"application/json"})
+    return JSONResponse({"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": msg}},
+                        headers={"Content-Type": "application/json"})
 
 
 async def handle_health(request: Request):
     return JSONResponse({
-        "status": "ok",
-        "name":   "criminomos",
-        "arrets": len(ARRETS),
-        "version": "9.0"
+        "status":  "ok",
+        "name":    "criminomos",
+        "arrets":  len(ARRETS),
+        "version": "10.0"
     })
 
 
 async def handle_reload(request: Request):
-    """Rechargement des données depuis Google Drive.
-    Appel : GET /reload?key=VOTRE_CLE
-    """
     global ARRETS, ARRETS_BY_ID
     key = request.query_params.get("key", "")
     if key != RELOAD_KEY:
@@ -344,7 +511,7 @@ async def handle_mcp(request: Request):
     if request.method == "GET":
         return JSONResponse({
             "name": "criminomos",
-            "version": "1.0.0",
+            "version": "10.0",
             "protocolVersion": "2025-11-25"
         })
 
@@ -359,11 +526,11 @@ async def handle_mcp(request: Request):
     except Exception:
         return err(None, -32700, "Parse error")
 
-    method  = data.get("method", "")
-    params  = data.get("params", {})
-    req_id  = data.get("id", 1)
+    method = data.get("method", "")
+    params = data.get("params", {})
+    req_id = data.get("id", 1)
 
-    logger.info(f"MCP {method} | session={request.headers.get('mcp-session-id','—')}")
+    logger.info(f"MCP {method}")
 
     if method == "initialize":
         sid = str(uuid.uuid4())
@@ -371,7 +538,7 @@ async def handle_mcp(request: Request):
         resp = ok(req_id, {
             "protocolVersion": "2025-11-25",
             "capabilities":    {"tools": {"listChanged": False}},
-            "serverInfo":      {"name": "criminomos", "version": "1.0.0"}
+            "serverInfo":      {"name": "criminomos", "version": "10.0"}
         })
         resp.headers["mcp-session-id"] = sid
         return resp
@@ -404,7 +571,7 @@ middleware = [
     Middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_methods=["GET","POST","DELETE","OPTIONS"],
+        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
         allow_headers=["*"],
         expose_headers=["mcp-session-id"]
     )
@@ -412,9 +579,9 @@ middleware = [
 
 app = Starlette(
     routes=[
-        Route("/",       handle_health, methods=["GET","HEAD"]),
+        Route("/",       handle_health, methods=["GET", "HEAD"]),
         Route("/reload", handle_reload, methods=["GET"]),
-        Route("/mcp",    handle_mcp,    methods=["GET","POST","DELETE"]),
+        Route("/mcp",    handle_mcp,    methods=["GET", "POST", "DELETE"]),
     ],
     middleware=middleware
 )
