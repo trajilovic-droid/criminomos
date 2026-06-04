@@ -1,5 +1,5 @@
-# Criminomos - Serveur MCP v12
-# Protection par token + journal d'accès + limite sessions simultanées
+# Criminomos - Serveur MCP v13
+# Compatible Claude.ai avec endpoints OAuth 2.1 discovery
 import json
 import re
 import unicodedata
@@ -7,7 +7,6 @@ import os
 import uuid
 import logging
 import io
-import time
 from pathlib import Path
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -30,11 +29,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-GDRIVE_FILE_ID   = os.environ.get("GDRIVE_FILE_ID", "18ylKTce78zSdEpeJ8tBbPchPIGs-kG4w")
-RELOAD_KEY       = os.environ.get("RELOAD_KEY", "iuris2026!")
-GDRIVE_URL       = f"https://docs.google.com/spreadsheets/d/{GDRIVE_FILE_ID}/export?format=xlsx"
-MAX_SESSIONS     = int(os.environ.get("MAX_SESSIONS_PER_TOKEN", "2"))
-MAX_LOG_ENTRIES  = 500  # Nombre max d'entrées dans le journal en mémoire
+GDRIVE_FILE_ID  = os.environ.get("GDRIVE_FILE_ID", "18ylKTce78zSdEpeJ8tBbPchPIGs-kG4w")
+RELOAD_KEY      = os.environ.get("RELOAD_KEY", "iuris2026!")
+GDRIVE_URL      = f"https://docs.google.com/spreadsheets/d/{GDRIVE_FILE_ID}/export?format=xlsx"
+BASE_URL        = os.environ.get("BASE_URL", "https://mcp.criminomos.ch")
+MAX_SESSIONS    = int(os.environ.get("MAX_SESSIONS_PER_TOKEN", "2"))
+MAX_LOG_ENTRIES = 500
 
 def load_tokens():
     raw = os.environ.get("ACCESS_TOKENS", "")
@@ -45,9 +45,9 @@ def load_tokens():
 ACCESS_TOKENS = load_tokens()
 
 # ---------------------------------------------------------------------------
-# Journal d'accès (en mémoire)
+# Journal d'accès
 # ---------------------------------------------------------------------------
-ACCESS_LOG = []  # Liste de dicts {token, ip, action, timestamp}
+ACCESS_LOG = []
 
 def log_access(token, ip, action):
     entry = {
@@ -58,46 +58,36 @@ def log_access(token, ip, action):
     }
     ACCESS_LOG.append(entry)
     if len(ACCESS_LOG) > MAX_LOG_ENTRIES:
-        ACCESS_LOG.pop(0)  # Supprimer la plus ancienne entrée
+        ACCESS_LOG.pop(0)
     logger.info(f"ACCESS | token={token} | ip={ip} | action={action}")
 
-# Sessions actives par token : token -> set of session_ids
 TOKEN_SESSIONS = defaultdict(set)
 
 # ---------------------------------------------------------------------------
 # Authentification
 # ---------------------------------------------------------------------------
 def get_token(request: Request) -> str:
-    """Extrait le token de la requête."""
     auth = request.headers.get("authorization", "")
     if auth.startswith("Bearer "):
         return auth[7:].strip()
     return request.headers.get("x-api-key", "").strip()
 
 def is_authorized(request: Request) -> tuple:
-    """
-    Retourne (autorisé, token, message).
-    """
     if not ACCESS_TOKENS:
         return True, "anonymous", "ok"
-
     token = get_token(request)
     if not token:
-        return False, "", "Token manquant — veuillez configurer votre clé d'accès"
+        return False, "", "Token manquant"
     if token not in ACCESS_TOKENS:
         return False, token, "Token invalide"
     return True, token, "ok"
 
 def check_concurrent_sessions(token: str, session_id: str) -> bool:
-    """
-    Vérifie si le token dépasse la limite de sessions simultanées.
-    Retourne True si autorisé.
-    """
     sessions = TOKEN_SESSIONS[token]
     if session_id in sessions:
-        return True  # Session déjà connue
+        return True
     if len(sessions) >= MAX_SESSIONS:
-        return False  # Trop de sessions simultanées
+        return False
     return True
 
 # ---------------------------------------------------------------------------
@@ -170,8 +160,8 @@ def expand_query_multilang(query_words):
 # Chargement des données
 # ---------------------------------------------------------------------------
 def parse_excel(content: bytes) -> list:
-    sheets = pd.read_excel(io.BytesIO(content), sheet_name=None)
-    wb     = load_workbook(io.BytesIO(content))
+    sheets  = pd.read_excel(io.BytesIO(content), sheet_name=None)
+    wb      = load_workbook(io.BytesIO(content))
     url_map = {}
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
@@ -239,7 +229,7 @@ except Exception as e:
     logger.warning(f"Google Drive inaccessible ({e}), chargement local.")
     ARRETS, ARRETS_BY_ID = load_from_local()
 
-SESSIONS = {}  # session_id -> token
+SESSIONS = {}
 
 # ---------------------------------------------------------------------------
 # Outils MCP
@@ -251,7 +241,7 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query":      {"type": "string",  "description": "Mots-cles en francais, allemand ou italien"},
+                "query":      {"type": "string",  "description": "Mots-cles de recherche"},
                 "infraction": {"type": "string",  "description": "Type d infraction ex: Expulsion"},
                 "article":    {"type": "string",  "description": "Article de loi ex: 66a CP"},
                 "annee":      {"type": "string",  "description": "Annee ex: 2024"},
@@ -285,12 +275,12 @@ TOOLS = [
     },
     {
         "name": "get_references_deep",
-        "description": "Remonte les references sur 2 niveaux de profondeur. Retourne un arbre complet des citations.",
+        "description": "Remonte les references sur 2 niveaux de profondeur.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "arret_id": {"type": "string",  "description": "Numero d arret de depart"},
-                "max_refs": {"type": "integer", "description": "Nombre max de refs niveau 1 a explorer (defaut 5, max 10)"}
+                "max_refs": {"type": "integer", "description": "Nombre max de refs niveau 1 (defaut 5, max 10)"}
             },
             "required": ["arret_id"]
         }
@@ -440,8 +430,8 @@ def get_references_deep(arret_id, max_refs=5):
         return "Erreur : " + str(e)
     atf1, tf1 = _extract_refs(text1, arret_id)
     lines.append("NIVEAU 1 — References directes")
-    lines.append("ATF cites : "       + (", ".join(atf1)      if atf1      else "aucun"))
-    lines.append("Arrets TF cites : " + (", ".join(tf1[:20])  if tf1       else "aucun"))
+    lines.append("ATF cites : "       + (", ".join(atf1)     if atf1 else "aucun"))
+    lines.append("Arrets TF cites : " + (", ".join(tf1[:20]) if tf1  else "aucun"))
     lines.append("")
     for ref_id in tf1[:max_refs]:
         try:
@@ -509,12 +499,87 @@ def err(req_id, code, msg):
                         headers={"Content-Type": "application/json"})
 
 
+# ---------------------------------------------------------------------------
+# OAuth 2.1 Discovery Endpoints (requis par Claude.ai)
+# Ces endpoints indiquent à Claude.ai que le serveur est public (pas d'auth requise)
+# ---------------------------------------------------------------------------
+async def handle_oauth_protected_resource(request: Request):
+    """RFC 9728 — Protected Resource Metadata.
+    Indique à Claude.ai comment s'authentifier (ici : pas d'auth requise).
+    """
+    return JSONResponse({
+        "resource":                  BASE_URL,
+        "authorization_servers":     [BASE_URL],
+        "bearer_methods_supported":  ["header"],
+        "scopes_supported":          [],
+    })
+
+
+async def handle_oauth_authorization_server(request: Request):
+    """RFC 8414 — Authorization Server Metadata.
+    Serveur OAuth minimal qui accepte tous les tokens.
+    """
+    return JSONResponse({
+        "issuer":                                BASE_URL,
+        "authorization_endpoint":               BASE_URL + "/oauth/authorize",
+        "token_endpoint":                        BASE_URL + "/oauth/token",
+        "registration_endpoint":                 BASE_URL + "/oauth/register",
+        "response_types_supported":              ["code"],
+        "grant_types_supported":                 ["authorization_code"],
+        "code_challenge_methods_supported":      ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+    })
+
+
+async def handle_oauth_authorize(request: Request):
+    """Endpoint d'autorisation OAuth — redirige directement vers Claude.ai."""
+    redirect_uri  = request.query_params.get("redirect_uri", "https://claude.ai/api/mcp/auth_callback")
+    state         = request.query_params.get("state", "")
+    code          = str(uuid.uuid4()).replace("-", "")[:16]
+    separator     = "&" if "?" in redirect_uri else "?"
+    redirect_url  = f"{redirect_uri}{separator}code={code}&state={state}"
+    return Response(
+        status_code=302,
+        headers={"Location": redirect_url}
+    )
+
+
+async def handle_oauth_token(request: Request):
+    """Endpoint de token OAuth — émet un token anonyme."""
+    return JSONResponse({
+        "access_token":  "criminomos-public-" + str(uuid.uuid4())[:8],
+        "token_type":    "Bearer",
+        "expires_in":    86400,
+        "scope":         "",
+    })
+
+
+async def handle_oauth_register(request: Request):
+    """Dynamic Client Registration — accepte tout client."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    client_id = "client-" + str(uuid.uuid4())[:8]
+    return JSONResponse({
+        "client_id":                client_id,
+        "client_secret":            "",
+        "redirect_uris":            body.get("redirect_uris", []),
+        "grant_types":              ["authorization_code"],
+        "response_types":           ["code"],
+        "token_endpoint_auth_method": "none",
+    }, status_code=201)
+
+
+# ---------------------------------------------------------------------------
+# Handlers principaux
+# ---------------------------------------------------------------------------
 async def handle_health(request: Request):
     return JSONResponse({
         "status":   "ok",
         "name":     "criminomos",
         "arrets":   len(ARRETS),
-        "version":  "12.0",
+        "version":  "13.0",
         "auth":     "enabled" if ACCESS_TOKENS else "disabled",
         "sessions": {t: len(s) for t, s in TOKEN_SESSIONS.items()}
     })
@@ -533,31 +598,15 @@ async def handle_reload(request: Request):
 
 
 async def handle_log(request: Request):
-    """Journal d'accès — accessible uniquement avec la clé RELOAD_KEY."""
     key = request.query_params.get("key", "")
     if key != RELOAD_KEY:
         return JSONResponse({"error": "Clé invalide"}, status_code=403)
     token_filter = request.query_params.get("token", "")
     logs = ACCESS_LOG if not token_filter else [e for e in ACCESS_LOG if e["token"] == token_filter]
-    return JSONResponse({
-        "total":   len(logs),
-        "entries": list(reversed(logs[-100:]))  # 100 dernières entrées, plus récentes en premier
-    })
-
-
-async def handle_sessions(request: Request):
-    """Sessions actives — accessible uniquement avec la clé RELOAD_KEY."""
-    key = request.query_params.get("key", "")
-    if key != RELOAD_KEY:
-        return JSONResponse({"error": "Clé invalide"}, status_code=403)
-    return JSONResponse({
-        "max_per_token": MAX_SESSIONS,
-        "active": {t: list(s) for t, s in TOKEN_SESSIONS.items()}
-    })
+    return JSONResponse({"total": len(logs), "entries": list(reversed(logs[-100:]))})
 
 
 async def handle_revoke(request: Request):
-    """Révocation des sessions d'un token."""
     key   = request.query_params.get("key", "")
     token = request.query_params.get("token", "")
     if key != RELOAD_KEY:
@@ -572,11 +621,16 @@ async def handle_revoke(request: Request):
 
 async def handle_mcp(request: Request):
     if request.method == "GET":
-        return JSONResponse({
-            "name":            "criminomos",
-            "version":         "12.0",
-            "protocolVersion": "2025-11-25"
-        })
+        return JSONResponse(
+            {"name": "criminomos", "version": "13.0", "protocolVersion": "2025-11-25"},
+            headers={"MCP-Protocol-Version": "2025-11-25"}
+        )
+
+    if request.method == "HEAD":
+        return Response(
+            status_code=200,
+            headers={"MCP-Protocol-Version": "2025-11-25"}
+        )
 
     if request.method == "DELETE":
         sid   = request.headers.get("mcp-session-id")
@@ -586,7 +640,7 @@ async def handle_mcp(request: Request):
             log_access(token, request.client.host if request.client else "unknown", "disconnect")
         return Response(status_code=200)
 
-    # Vérification du token
+    # Vérification du token pour POST
     authorized, token, msg = is_authorized(request)
     if not authorized:
         log_access(token or "unknown", request.client.host if request.client else "unknown", "denied:" + msg)
@@ -600,28 +654,23 @@ async def handle_mcp(request: Request):
     method = data.get("method", "")
     params = data.get("params", {})
     req_id = data.get("id", 1)
-
-    ip = request.client.host if request.client else "unknown"
+    ip     = request.client.host if request.client else "unknown"
 
     if method == "initialize":
         sid = str(uuid.uuid4())
-
-        # Vérifier la limite de sessions simultanées
         if not check_concurrent_sessions(token, sid):
             log_access(token, ip, "blocked:max_sessions")
             return JSONResponse(
-                {"error": f"Limite de {MAX_SESSIONS} session(s) simultanée(s) atteinte pour ce token. Vérifiez que votre token n'est pas partagé."},
+                {"error": f"Limite de {MAX_SESSIONS} session(s) simultanée(s) atteinte."},
                 status_code=429
             )
-
         SESSIONS[sid]             = token
         TOKEN_SESSIONS[token].add(sid)
         log_access(token, ip, "connect")
-
         resp = ok(req_id, {
             "protocolVersion": "2025-11-25",
             "capabilities":    {"tools": {"listChanged": False}},
-            "serverInfo":      {"name": "criminomos", "version": "12.0"}
+            "serverInfo":      {"name": "criminomos", "version": "13.0"}
         })
         resp.headers["mcp-session-id"] = sid
         return resp
@@ -656,20 +705,27 @@ middleware = [
     Middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_methods=["GET", "POST", "DELETE", "HEAD", "OPTIONS"],
         allow_headers=["*"],
-        expose_headers=["mcp-session-id"]
+        expose_headers=["mcp-session-id", "MCP-Protocol-Version"]
     )
 ]
 
 app = Starlette(
     routes=[
-        Route("/",        handle_health,   methods=["GET", "HEAD"]),
-        Route("/reload",  handle_reload,   methods=["GET"]),
-        Route("/log",     handle_log,      methods=["GET"]),
-        Route("/sessions",handle_sessions, methods=["GET"]),
-        Route("/revoke",  handle_revoke,   methods=["GET"]),
-        Route("/mcp",     handle_mcp,      methods=["GET", "POST", "DELETE"]),
+        # Santé & admin
+        Route("/",        handle_health,  methods=["GET", "HEAD"]),
+        Route("/reload",  handle_reload,  methods=["GET"]),
+        Route("/log",     handle_log,     methods=["GET"]),
+        Route("/revoke",  handle_revoke,  methods=["GET"]),
+        # OAuth 2.1 discovery (requis par Claude.ai)
+        Route("/.well-known/oauth-protected-resource",   handle_oauth_protected_resource,   methods=["GET"]),
+        Route("/.well-known/oauth-authorization-server", handle_oauth_authorization_server, methods=["GET"]),
+        Route("/oauth/authorize", handle_oauth_authorize, methods=["GET"]),
+        Route("/oauth/token",     handle_oauth_token,     methods=["POST"]),
+        Route("/oauth/register",  handle_oauth_register,  methods=["POST"]),
+        # MCP
+        Route("/mcp", handle_mcp, methods=["GET", "POST", "DELETE", "HEAD"]),
     ],
     middleware=middleware
 )
