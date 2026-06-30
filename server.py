@@ -275,12 +275,19 @@ TOOLS = [
     },
     {
         "name": "get_references_deep",
-        "description": "Remonte les references sur 2 niveaux de profondeur.",
+        "description": """Remonte les references sur plusieurs niveaux de profondeur.
+Par defaut explore 2 niveaux (references directes + leurs propres references).
+Pour une recherche tres approfondie sur un sujet complexe, utilisez profondeur=3
+qui explore un niveau supplementaire — cela prend plus de temps (1-2 minutes)
+mais offre une cartographie quasi exhaustive de la jurisprudence de reference.
+N'utilisez profondeur=3 que si l'utilisateur demande explicitement une recherche
+exhaustive, approfondie ou complete.""",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "arret_id": {"type": "string",  "description": "Numero d arret de depart"},
-                "max_refs": {"type": "integer", "description": "Nombre max de refs niveau 1 (defaut 5, max 10)"}
+                "arret_id":   {"type": "string",  "description": "Numero d arret de depart"},
+                "max_refs":   {"type": "integer", "description": "Nombre max de refs niveau 1 (defaut 10, max 15)"},
+                "profondeur": {"type": "integer", "description": "Profondeur d exploration : 2 (defaut, rapide) ou 3 (exhaustif, lent)"}
             },
             "required": ["arret_id"]
         }
@@ -390,7 +397,7 @@ def get_fulltext(arret_id):
     url = _arret_url(arret_id)
     try:
         text = _fetch_text(url)
-        return "Arret " + arret_id + "\nURL : " + url + "\n" + "-"*60 + "\n\n" + text[:15000]
+        return "Arret " + arret_id + "\nURL : " + url + "\n" + "-"*60 + "\n\n" + text[:30000]
     except Exception as e:
         return "Erreur : " + str(e)
 
@@ -420,32 +427,52 @@ def get_references(arret_id):
     return "\n".join(lines)
 
 
-def get_references_deep(arret_id, max_refs=5):
-    max_refs = min(int(max_refs), 10)
-    url      = _arret_url(arret_id)
-    lines    = ["=== REFERENCES PROFONDES : " + arret_id + " ===\n"]
+def get_references_deep(arret_id, max_refs=10, profondeur=2):
+    max_refs   = min(int(max_refs), 15)
+    profondeur = min(max(int(profondeur), 2), 3)  # entre 2 et 3
+    url        = _arret_url(arret_id)
+    lines      = ["=== REFERENCES PROFONDES (niveau " + str(profondeur) + ") : " + arret_id + " ===\n"]
+
     try:
         text1 = _fetch_text(url)
     except Exception as e:
         return "Erreur : " + str(e)
+
     atf1, tf1 = _extract_refs(text1, arret_id)
     lines.append("NIVEAU 1 — References directes")
     lines.append("ATF cites : "       + (", ".join(atf1)     if atf1 else "aucun"))
-    lines.append("Arrets TF cites : " + (", ".join(tf1[:20]) if tf1  else "aucun"))
+    lines.append("Arrets TF cites : " + (", ".join(tf1[:30]) if tf1  else "aucun"))
     lines.append("")
+
+    # Garder trace des arrêts/ATF déjà explorés pour éviter les doublons et boucles
+    explored_tf  = {arret_id}
+    explored_atf = set()
+
+    # NIVEAU 2 — références des références TF
+    niveau2_tf_refs = {}  # ref_id -> (atf_list, tf_list)
     for ref_id in tf1[:max_refs]:
+        if ref_id in explored_tf:
+            continue
+        explored_tf.add(ref_id)
         try:
             text2     = _fetch_text(_arret_url(ref_id))
             atf2, tf2 = _extract_refs(text2, ref_id)
-            meta      = ARRETS_BY_ID.get(ref_id)
-            objet     = meta.get("objet", "—") if meta else "hors base"
-            lines.append("\n  " + ref_id + " (" + objet + ")")
-            if atf2: lines.append("  ATF cites : "       + ", ".join(atf2[:5]))
-            if tf2:  lines.append("  Arrets TF cites : " + ", ".join(tf2[:5]))
-            if not atf2 and not tf2: lines.append("  (aucune reference)")
+            niveau2_tf_refs[ref_id] = (atf2, tf2)
+            meta  = ARRETS_BY_ID.get(ref_id)
+            objet = meta.get("objet", "—") if meta else "hors base"
+            lines.append("\n  [N2] " + ref_id + " (" + objet + ")")
+            if atf2: lines.append("       ATF cites : "       + ", ".join(atf2[:10]))
+            if tf2:  lines.append("       Arrets TF cites : " + ", ".join(tf2[:10]))
+            if not atf2 and not tf2: lines.append("       (aucune reference)")
         except Exception as e:
-            lines.append("\n  " + ref_id + " — Erreur : " + str(e))
-    for atf_ref in atf1[:3]:
+            lines.append("\n  [N2] " + ref_id + " — Erreur : " + str(e))
+
+    # NIVEAU 2 — références des ATF cités
+    niveau2_atf_refs = {}
+    for atf_ref in atf1[:8]:
+        if atf_ref in explored_atf:
+            continue
+        explored_atf.add(atf_ref)
         m = re.match(r"ATF\s+(\d{2,3})\s+([IVX]+)\s+(\d+)", atf_ref)
         if m:
             vol, part, page = m.groups()
@@ -454,11 +481,50 @@ def get_references_deep(arret_id, max_refs=5):
             try:
                 text_atf  = _fetch_text(atf_url)
                 atf2, tf2 = _extract_refs(text_atf, "")
-                lines.append("\n  " + atf_ref)
-                if atf2: lines.append("  ATF cites : "       + ", ".join(atf2[:5]))
-                if tf2:  lines.append("  Arrets TF cites : " + ", ".join(tf2[:5]))
+                niveau2_atf_refs[atf_ref] = (atf2, tf2)
+                lines.append("\n  [N2] " + atf_ref)
+                if atf2: lines.append("       ATF cites : "       + ", ".join(atf2[:10]))
+                if tf2:  lines.append("       Arrets TF cites : " + ", ".join(tf2[:10]))
             except Exception as e:
-                lines.append("\n  " + atf_ref + " — Erreur : " + str(e))
+                lines.append("\n  [N2] " + atf_ref + " — Erreur : " + str(e))
+
+    # NIVEAU 3 — uniquement si demandé explicitement
+    if profondeur >= 3:
+        lines.append("\n\nNIVEAU 3 — References des references de niveau 2 (exploration exhaustive)")
+
+        # Collecter toutes les références TF de niveau 2, dédupliquées
+        niveau3_candidates = []
+        for ref_id, (atf2, tf2) in niveau2_tf_refs.items():
+            for r in tf2[:5]:  # limiter à 5 par parent pour contenir le volume
+                if r not in explored_tf:
+                    niveau3_candidates.append(r)
+        for atf_ref, (atf2, tf2) in niveau2_atf_refs.items():
+            for r in tf2[:5]:
+                if r not in explored_tf:
+                    niveau3_candidates.append(r)
+
+        # Dédupliquer et limiter le volume total (max 15 arrêts au niveau 3)
+        niveau3_candidates = list(dict.fromkeys(niveau3_candidates))[:15]
+
+        if not niveau3_candidates:
+            lines.append("  Aucune nouvelle reference a explorer au niveau 3.")
+        else:
+            for ref_id in niveau3_candidates:
+                explored_tf.add(ref_id)
+                try:
+                    text3     = _fetch_text(_arret_url(ref_id))
+                    atf3, tf3 = _extract_refs(text3, ref_id)
+                    meta      = ARRETS_BY_ID.get(ref_id)
+                    objet     = meta.get("objet", "—") if meta else "hors base"
+                    lines.append("\n    [N3] " + ref_id + " (" + objet + ")")
+                    if atf3: lines.append("         ATF cites : "       + ", ".join(atf3[:8]))
+                    if tf3:  lines.append("         Arrets TF cites : " + ", ".join(tf3[:8]))
+                    if not atf3 and not tf3: lines.append("         (aucune reference)")
+                except Exception as e:
+                    lines.append("\n    [N3] " + ref_id + " — Erreur : " + str(e))
+
+        lines.append(f"\n\nTotal arrets explores : {len(explored_tf)} | ATF explores : {len(explored_atf)}")
+
     return "\n".join(lines)
 
 
@@ -473,7 +539,7 @@ def get_arret_by_reference(reference):
                f"?lang=fr&type=show_document&highlight_docid=atf:///{vol}/{part}/{page}")
         try:
             text = _fetch_text(url)
-            return reference + "\nURL : " + url + "\n" + "-"*60 + "\n\n" + text[:15000]
+            return reference + "\nURL : " + url + "\n" + "-"*60 + "\n\n" + text[:30000]
         except Exception as e:
             return "Erreur : " + str(e)
     return "Format non reconnu : " + reference
