@@ -1,5 +1,5 @@
-# Criminomos - Serveur MCP v13
-# Compatible Claude.ai avec endpoints OAuth 2.1 discovery
+# Criminomos - Serveur MCP v15
+# Compatible Claude.ai avec endpoints OAuth 2.1 discovery + recherche profonde niveau 3
 import json
 import re
 import unicodedata
