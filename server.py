@@ -645,7 +645,7 @@ async def handle_health(request: Request):
         "status":   "ok",
         "name":     "criminomos",
         "arrets":   len(ARRETS),
-        "version":  "13.0",
+        "version":  "15.0",
         "auth":     "enabled" if ACCESS_TOKENS else "disabled",
         "sessions": {t: len(s) for t, s in TOKEN_SESSIONS.items()}
     })
@@ -688,7 +688,7 @@ async def handle_revoke(request: Request):
 async def handle_mcp(request: Request):
     if request.method == "GET":
         return JSONResponse(
-            {"name": "criminomos", "version": "13.0", "protocolVersion": "2025-11-25"},
+            {"name": "criminomos", "version": "15.0", "protocolVersion": "2025-11-25"},
             headers={"MCP-Protocol-Version": "2025-11-25"}
         )
 
@@ -736,7 +736,7 @@ async def handle_mcp(request: Request):
         resp = ok(req_id, {
             "protocolVersion": "2025-11-25",
             "capabilities":    {"tools": {"listChanged": False}},
-            "serverInfo":      {"name": "criminomos", "version": "13.0"}
+            "serverInfo":      {"name": "criminomos", "version": "15.0"}
         })
         resp.headers["mcp-session-id"] = sid
         return resp
