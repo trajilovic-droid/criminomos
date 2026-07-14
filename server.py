@@ -83,6 +83,9 @@ def is_authorized(request: Request) -> tuple:
     return True, token, "ok"
 
 def check_concurrent_sessions(token: str, session_id: str) -> bool:
+    # Tokens OAuth publics et anonymous — pas de limite de sessions
+    if token.startswith("criminomos-public-") or token == "anonymous":
+        return True
     sessions = TOKEN_SESSIONS[token]
     if session_id in sessions:
         return True
