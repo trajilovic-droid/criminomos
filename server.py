@@ -1,5 +1,5 @@
-# Criminomos - Serveur MCP v15
-# Compatible Claude.ai avec endpoints OAuth 2.1 discovery + recherche profonde niveau 3
+# Criminomos - Serveur MCP v18
+# Sans authentification + fix SSL bger.ch + recherche profonde niveau 3
 import json
 import re
 import unicodedata
@@ -33,25 +33,16 @@ GDRIVE_FILE_ID  = os.environ.get("GDRIVE_FILE_ID", "18ylKTce78zSdEpeJ8tBbPchPIGs
 RELOAD_KEY      = os.environ.get("RELOAD_KEY", "iuris2026!")
 GDRIVE_URL      = f"https://docs.google.com/spreadsheets/d/{GDRIVE_FILE_ID}/export?format=xlsx"
 BASE_URL        = os.environ.get("BASE_URL", "https://mcp.criminomos.ch")
-MAX_SESSIONS    = int(os.environ.get("MAX_SESSIONS_PER_TOKEN", "2"))
 MAX_LOG_ENTRIES = 500
-
-def load_tokens():
-    raw = os.environ.get("ACCESS_TOKENS", "")
-    if not raw.strip():
-        return set()
-    return {t.strip() for t in raw.split(",") if t.strip()}
-
-ACCESS_TOKENS = load_tokens()
 
 # ---------------------------------------------------------------------------
 # Journal d'accès
 # ---------------------------------------------------------------------------
 ACCESS_LOG = []
 
-def log_access(token, ip, action):
+def log_access(client_id, ip, action):
     entry = {
-        "token":     token,
+        "client_id": client_id,
         "ip":        ip,
         "action":    action,
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -59,39 +50,7 @@ def log_access(token, ip, action):
     ACCESS_LOG.append(entry)
     if len(ACCESS_LOG) > MAX_LOG_ENTRIES:
         ACCESS_LOG.pop(0)
-    logger.info(f"ACCESS | token={token} | ip={ip} | action={action}")
-
-TOKEN_SESSIONS = defaultdict(set)
-
-# ---------------------------------------------------------------------------
-# Authentification
-# ---------------------------------------------------------------------------
-def get_token(request: Request) -> str:
-    auth = request.headers.get("authorization", "")
-    if auth.startswith("Bearer "):
-        return auth[7:].strip()
-    return request.headers.get("x-api-key", "").strip()
-
-def is_authorized(request: Request) -> tuple:
-    if not ACCESS_TOKENS:
-        return True, "anonymous", "ok"
-    token = get_token(request)
-    if not token:
-        return False, "", "Token manquant"
-    if token not in ACCESS_TOKENS:
-        return False, token, "Token invalide"
-    return True, token, "ok"
-
-def check_concurrent_sessions(token: str, session_id: str) -> bool:
-    # Tokens OAuth publics et anonymous — pas de limite de sessions
-    if token.startswith("criminomos-public-") or token == "anonymous":
-        return True
-    sessions = TOKEN_SESSIONS[token]
-    if session_id in sessions:
-        return True
-    if len(sessions) >= MAX_SESSIONS:
-        return False
-    return True
+    logger.info(f"ACCESS | client={client_id} | ip={ip} | action={action}")
 
 # ---------------------------------------------------------------------------
 # Dictionnaire multilingue
@@ -232,8 +191,6 @@ except Exception as e:
     logger.warning(f"Google Drive inaccessible ({e}), chargement local.")
     ARRETS, ARRETS_BY_ID = load_from_local()
 
-SESSIONS = {}
-
 # ---------------------------------------------------------------------------
 # Outils MCP
 # ---------------------------------------------------------------------------
@@ -279,18 +236,13 @@ TOOLS = [
     {
         "name": "get_references_deep",
         "description": """Remonte les references sur plusieurs niveaux de profondeur.
-Par defaut explore 2 niveaux (references directes + leurs propres references).
-Pour une recherche tres approfondie sur un sujet complexe, utilisez profondeur=3
-qui explore un niveau supplementaire — cela prend plus de temps (1-2 minutes)
-mais offre une cartographie quasi exhaustive de la jurisprudence de reference.
-N'utilisez profondeur=3 que si l'utilisateur demande explicitement une recherche
-exhaustive, approfondie ou complete.""",
+Par defaut explore 2 niveaux. Pour une recherche exhaustive, utilisez profondeur=3.""",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "arret_id":   {"type": "string",  "description": "Numero d arret de depart"},
                 "max_refs":   {"type": "integer", "description": "Nombre max de refs niveau 1 (defaut 10, max 15)"},
-                "profondeur": {"type": "integer", "description": "Profondeur d exploration : 2 (defaut, rapide) ou 3 (exhaustif, lent)"}
+                "profondeur": {"type": "integer", "description": "Profondeur : 2 (defaut) ou 3 (exhaustif)"}
             },
             "required": ["arret_id"]
         }
@@ -370,7 +322,9 @@ def search_arrets(query="", infraction="", article="", annee="", langue="", limi
 
 
 def _fetch_text(url):
-    resp = httpx.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"}, follow_redirects=True)
+    # verify=False nécessaire : bger.ch a une chaîne de certificats non reconnue sur Render
+    resp = httpx.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"},
+                     follow_redirects=True, verify=False)
     soup = BeautifulSoup(resp.text, "html.parser")
     for tag in soup(["script", "style", "nav", "header", "footer"]):
         tag.decompose()
@@ -432,30 +386,24 @@ def get_references(arret_id):
 
 def get_references_deep(arret_id, max_refs=10, profondeur=2):
     max_refs   = min(int(max_refs), 15)
-    profondeur = min(max(int(profondeur), 2), 3)  # entre 2 et 3
+    profondeur = min(max(int(profondeur), 2), 3)
     url        = _arret_url(arret_id)
     lines      = ["=== REFERENCES PROFONDES (niveau " + str(profondeur) + ") : " + arret_id + " ===\n"]
-
     try:
         text1 = _fetch_text(url)
     except Exception as e:
         return "Erreur : " + str(e)
-
     atf1, tf1 = _extract_refs(text1, arret_id)
     lines.append("NIVEAU 1 — References directes")
     lines.append("ATF cites : "       + (", ".join(atf1)     if atf1 else "aucun"))
     lines.append("Arrets TF cites : " + (", ".join(tf1[:30]) if tf1  else "aucun"))
     lines.append("")
-
-    # Garder trace des arrêts/ATF déjà explorés pour éviter les doublons et boucles
     explored_tf  = {arret_id}
     explored_atf = set()
-
-    # NIVEAU 2 — références des références TF
-    niveau2_tf_refs = {}  # ref_id -> (atf_list, tf_list)
+    niveau2_tf_refs  = {}
+    niveau2_atf_refs = {}
     for ref_id in tf1[:max_refs]:
-        if ref_id in explored_tf:
-            continue
+        if ref_id in explored_tf: continue
         explored_tf.add(ref_id)
         try:
             text2     = _fetch_text(_arret_url(ref_id))
@@ -469,12 +417,8 @@ def get_references_deep(arret_id, max_refs=10, profondeur=2):
             if not atf2 and not tf2: lines.append("       (aucune reference)")
         except Exception as e:
             lines.append("\n  [N2] " + ref_id + " — Erreur : " + str(e))
-
-    # NIVEAU 2 — références des ATF cités
-    niveau2_atf_refs = {}
     for atf_ref in atf1[:8]:
-        if atf_ref in explored_atf:
-            continue
+        if atf_ref in explored_atf: continue
         explored_atf.add(atf_ref)
         m = re.match(r"ATF\s+(\d{2,3})\s+([IVX]+)\s+(\d+)", atf_ref)
         if m:
@@ -490,27 +434,20 @@ def get_references_deep(arret_id, max_refs=10, profondeur=2):
                 if tf2:  lines.append("       Arrets TF cites : " + ", ".join(tf2[:10]))
             except Exception as e:
                 lines.append("\n  [N2] " + atf_ref + " — Erreur : " + str(e))
-
-    # NIVEAU 3 — uniquement si demandé explicitement
     if profondeur >= 3:
-        lines.append("\n\nNIVEAU 3 — References des references de niveau 2 (exploration exhaustive)")
-
-        # Collecter toutes les références TF de niveau 2, dédupliquées
+        lines.append("\n\nNIVEAU 3 — Exploration exhaustive")
         niveau3_candidates = []
         for ref_id, (atf2, tf2) in niveau2_tf_refs.items():
-            for r in tf2[:5]:  # limiter à 5 par parent pour contenir le volume
+            for r in tf2[:5]:
                 if r not in explored_tf:
                     niveau3_candidates.append(r)
         for atf_ref, (atf2, tf2) in niveau2_atf_refs.items():
             for r in tf2[:5]:
                 if r not in explored_tf:
                     niveau3_candidates.append(r)
-
-        # Dédupliquer et limiter le volume total (max 15 arrêts au niveau 3)
         niveau3_candidates = list(dict.fromkeys(niveau3_candidates))[:15]
-
         if not niveau3_candidates:
-            lines.append("  Aucune nouvelle reference a explorer au niveau 3.")
+            lines.append("  Aucune nouvelle reference au niveau 3.")
         else:
             for ref_id in niveau3_candidates:
                 explored_tf.add(ref_id)
@@ -525,9 +462,7 @@ def get_references_deep(arret_id, max_refs=10, profondeur=2):
                     if not atf3 and not tf3: lines.append("         (aucune reference)")
                 except Exception as e:
                     lines.append("\n    [N3] " + ref_id + " — Erreur : " + str(e))
-
-        lines.append(f"\n\nTotal arrets explores : {len(explored_tf)} | ATF explores : {len(explored_atf)}")
-
+        lines.append(f"\n\nTotal explores : {len(explored_tf)} arrets | {len(explored_atf)} ATF")
     return "\n".join(lines)
 
 
@@ -557,7 +492,7 @@ def call_tool(name, args):
     return "Outil inconnu : " + name
 
 # ---------------------------------------------------------------------------
-# Handlers HTTP
+# Helpers JSON-RPC
 # ---------------------------------------------------------------------------
 def ok(req_id, result):
     return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": result},
@@ -567,90 +502,16 @@ def err(req_id, code, msg):
     return JSONResponse({"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": msg}},
                         headers={"Content-Type": "application/json"})
 
-
 # ---------------------------------------------------------------------------
-# OAuth 2.1 Discovery Endpoints (requis par Claude.ai)
-# Ces endpoints indiquent à Claude.ai que le serveur est public (pas d'auth requise)
-# ---------------------------------------------------------------------------
-async def handle_oauth_protected_resource(request: Request):
-    """RFC 9728 — Protected Resource Metadata.
-    Indique à Claude.ai comment s'authentifier (ici : pas d'auth requise).
-    """
-    return JSONResponse({
-        "resource":                  BASE_URL,
-        "authorization_servers":     [BASE_URL],
-        "bearer_methods_supported":  ["header"],
-        "scopes_supported":          [],
-    })
-
-
-async def handle_oauth_authorization_server(request: Request):
-    """RFC 8414 — Authorization Server Metadata.
-    Serveur OAuth minimal qui accepte tous les tokens.
-    """
-    return JSONResponse({
-        "issuer":                                BASE_URL,
-        "authorization_endpoint":               BASE_URL + "/oauth/authorize",
-        "token_endpoint":                        BASE_URL + "/oauth/token",
-        "registration_endpoint":                 BASE_URL + "/oauth/register",
-        "response_types_supported":              ["code"],
-        "grant_types_supported":                 ["authorization_code"],
-        "code_challenge_methods_supported":      ["S256"],
-        "token_endpoint_auth_methods_supported": ["none"],
-    })
-
-
-async def handle_oauth_authorize(request: Request):
-    """Endpoint d'autorisation OAuth — redirige directement vers Claude.ai."""
-    redirect_uri  = request.query_params.get("redirect_uri", "https://claude.ai/api/mcp/auth_callback")
-    state         = request.query_params.get("state", "")
-    code          = str(uuid.uuid4()).replace("-", "")[:16]
-    separator     = "&" if "?" in redirect_uri else "?"
-    redirect_url  = f"{redirect_uri}{separator}code={code}&state={state}"
-    return Response(
-        status_code=302,
-        headers={"Location": redirect_url}
-    )
-
-
-async def handle_oauth_token(request: Request):
-    """Endpoint de token OAuth — émet un token anonyme."""
-    return JSONResponse({
-        "access_token":  "criminomos-public-" + str(uuid.uuid4())[:8],
-        "token_type":    "Bearer",
-        "expires_in":    86400,
-        "scope":         "",
-    })
-
-
-async def handle_oauth_register(request: Request):
-    """Dynamic Client Registration — accepte tout client."""
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    client_id = "client-" + str(uuid.uuid4())[:8]
-    return JSONResponse({
-        "client_id":                client_id,
-        "client_secret":            "",
-        "redirect_uris":            body.get("redirect_uris", []),
-        "grant_types":              ["authorization_code"],
-        "response_types":           ["code"],
-        "token_endpoint_auth_method": "none",
-    }, status_code=201)
-
-
-# ---------------------------------------------------------------------------
-# Handlers principaux
+# Handlers
 # ---------------------------------------------------------------------------
 async def handle_health(request: Request):
     return JSONResponse({
-        "status":   "ok",
-        "name":     "criminomos",
-        "arrets":   len(ARRETS),
-        "version":  "15.0",
-        "auth":     "enabled" if ACCESS_TOKENS else "disabled",
-        "sessions": {t: len(s) for t, s in TOKEN_SESSIONS.items()}
+        "status":  "ok",
+        "name":    "criminomos",
+        "arrets":  len(ARRETS),
+        "version": "18.0",
+        "auth":    "disabled",
     })
 
 
@@ -670,50 +531,21 @@ async def handle_log(request: Request):
     key = request.query_params.get("key", "")
     if key != RELOAD_KEY:
         return JSONResponse({"error": "Clé invalide"}, status_code=403)
-    token_filter = request.query_params.get("token", "")
-    logs = ACCESS_LOG if not token_filter else [e for e in ACCESS_LOG if e["token"] == token_filter]
-    return JSONResponse({"total": len(logs), "entries": list(reversed(logs[-100:]))})
-
-
-async def handle_revoke(request: Request):
-    key   = request.query_params.get("key", "")
-    token = request.query_params.get("token", "")
-    if key != RELOAD_KEY:
-        return JSONResponse({"error": "Clé invalide"}, status_code=403)
-    if not token:
-        return JSONResponse({"error": "Token manquant"}, status_code=400)
-    count = len(TOKEN_SESSIONS.get(token, set()))
-    TOKEN_SESSIONS[token] = set()
-    log_access(token, request.client.host if request.client else "unknown", "revoked_by_admin")
-    return JSONResponse({"status": "ok", "token": token, "sessions_revoked": count})
+    return JSONResponse({"total": len(ACCESS_LOG), "entries": list(reversed(ACCESS_LOG[-100:]))})
 
 
 async def handle_mcp(request: Request):
     if request.method == "GET":
         return JSONResponse(
-            {"name": "criminomos", "version": "15.0", "protocolVersion": "2025-11-25"},
+            {"name": "criminomos", "version": "18.0", "protocolVersion": "2025-11-25"},
             headers={"MCP-Protocol-Version": "2025-11-25"}
         )
-
     if request.method == "HEAD":
-        return Response(
-            status_code=200,
-            headers={"MCP-Protocol-Version": "2025-11-25"}
-        )
-
+        return Response(status_code=200, headers={"MCP-Protocol-Version": "2025-11-25"})
     if request.method == "DELETE":
-        sid   = request.headers.get("mcp-session-id")
-        token = SESSIONS.pop(sid, None) if sid else None
-        if token and sid:
-            TOKEN_SESSIONS[token].discard(sid)
-            log_access(token, request.client.host if request.client else "unknown", "disconnect")
         return Response(status_code=200)
 
-    # Vérification du token pour POST
-    authorized, token, msg = is_authorized(request)
-    if not authorized:
-        log_access(token or "unknown", request.client.host if request.client else "unknown", "denied:" + msg)
-        return JSONResponse({"error": msg}, status_code=401)
+    ip = request.client.host if request.client else "unknown"
 
     try:
         data = await request.json()
@@ -723,23 +555,14 @@ async def handle_mcp(request: Request):
     method = data.get("method", "")
     params = data.get("params", {})
     req_id = data.get("id", 1)
-    ip     = request.client.host if request.client else "unknown"
 
     if method == "initialize":
         sid = str(uuid.uuid4())
-        if not check_concurrent_sessions(token, sid):
-            log_access(token, ip, "blocked:max_sessions")
-            return JSONResponse(
-                {"error": f"Limite de {MAX_SESSIONS} session(s) simultanée(s) atteinte."},
-                status_code=429
-            )
-        SESSIONS[sid]             = token
-        TOKEN_SESSIONS[token].add(sid)
-        log_access(token, ip, "connect")
+        log_access("anonymous", ip, "connect")
         resp = ok(req_id, {
             "protocolVersion": "2025-11-25",
             "capabilities":    {"tools": {"listChanged": False}},
-            "serverInfo":      {"name": "criminomos", "version": "15.0"}
+            "serverInfo":      {"name": "criminomos", "version": "18.0"}
         })
         resp.headers["mcp-session-id"] = sid
         return resp
@@ -751,13 +574,13 @@ async def handle_mcp(request: Request):
         return ok(req_id, {})
 
     if method == "tools/list":
-        log_access(token, ip, "tools/list")
+        log_access("anonymous", ip, "tools/list")
         return ok(req_id, {"tools": TOOLS})
 
     if method == "tools/call":
         tool = params.get("name", "")
         args = params.get("arguments", {})
-        log_access(token, ip, "call:" + tool)
+        log_access("anonymous", ip, "call:" + tool)
         try:
             result = call_tool(tool, args)
         except Exception as e:
@@ -782,19 +605,10 @@ middleware = [
 
 app = Starlette(
     routes=[
-        # Santé & admin
-        Route("/",        handle_health,  methods=["GET", "HEAD"]),
-        Route("/reload",  handle_reload,  methods=["GET"]),
-        Route("/log",     handle_log,     methods=["GET"]),
-        Route("/revoke",  handle_revoke,  methods=["GET"]),
-        # OAuth 2.1 discovery (requis par Claude.ai)
-        Route("/.well-known/oauth-protected-resource",   handle_oauth_protected_resource,   methods=["GET"]),
-        Route("/.well-known/oauth-authorization-server", handle_oauth_authorization_server, methods=["GET"]),
-        Route("/oauth/authorize", handle_oauth_authorize, methods=["GET"]),
-        Route("/oauth/token",     handle_oauth_token,     methods=["POST"]),
-        Route("/oauth/register",  handle_oauth_register,  methods=["POST"]),
-        # MCP
-        Route("/mcp", handle_mcp, methods=["GET", "POST", "DELETE", "HEAD"]),
+        Route("/",       handle_health, methods=["GET", "HEAD"]),
+        Route("/reload", handle_reload, methods=["GET"]),
+        Route("/log",    handle_log,    methods=["GET"]),
+        Route("/mcp",    handle_mcp,    methods=["GET", "POST", "DELETE", "HEAD"]),
     ],
     middleware=middleware
 )
