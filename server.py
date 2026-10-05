@@ -1,10 +1,11 @@
-# Criminomos - Serveur MCP v18
-# Sans authentification + TLS bger.ch vérifié + repli entscheidsuche.ch + recherche profonde niveau 3
+# Criminomos - Serveur MCP v19
+# Jetons d'accès optionnels (ACCESS_TOKENS) + TLS bger.ch vérifié + repli entscheidsuche.ch + recherche profonde niveau 3
 import json
 import re
 import unicodedata
 import os
 import uuid
+import hmac
 import logging
 import io
 import ssl
@@ -33,7 +34,16 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 GDRIVE_FILE_ID  = os.environ.get("GDRIVE_FILE_ID", "18ylKTce78zSdEpeJ8tBbPchPIGs-kG4w")
-RELOAD_KEY      = os.environ.get("RELOAD_KEY", "iuris2026!")
+# Aucune valeur par défaut : sans variable RELOAD_KEY sur Render, /reload et
+# /log sont désactivés plutôt que protégés par une clé publiée sur GitHub.
+RELOAD_KEY      = os.environ.get("RELOAD_KEY", "").strip()
+# Jetons d'accès au serveur MCP, au format "nom:jeton,nom2:jeton2".
+# Variable absente ou vide : serveur ouvert (comportement actuel).
+ACCESS_TOKENS   = {
+    tok.strip(): name.strip()
+    for name, _, tok in (p.partition(":") for p in os.environ.get("ACCESS_TOKENS", "").split(","))
+    if name.strip() and tok.strip()
+}
 GDRIVE_URL      = f"https://docs.google.com/spreadsheets/d/{GDRIVE_FILE_ID}/export?format=xlsx"
 BASE_URL        = os.environ.get("BASE_URL", "https://mcp.criminomos.ch")
 MAX_LOG_ENTRIES = 500
@@ -648,21 +658,53 @@ def err(req_id, code, msg):
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Contrôle d'accès
+# ---------------------------------------------------------------------------
+def _same(a, b):
+    """Comparaison en temps constant (évite de deviner une clé par la durée)."""
+    return hmac.compare_digest(a.encode(), b.encode())
+
+
+def _admin_denied(request):
+    """None si la requête d'administration est autorisée, sinon la réponse d'erreur."""
+    if not RELOAD_KEY:
+        return JSONResponse({"error": "Administration désactivée : variable RELOAD_KEY absente"},
+                            status_code=503)
+    key = request.headers.get("x-reload-key") or request.query_params.get("key", "")
+    if not _same(key, RELOAD_KEY):
+        return JSONResponse({"error": "Clé invalide"}, status_code=403)
+    return None
+
+
+def _client_name(request):
+    """Nom du titulaire du jeton, 'anonymous' si l'accès est ouvert,
+    None si un jeton est exigé et absent ou invalide."""
+    if not ACCESS_TOKENS:
+        return "anonymous"
+    auth  = request.headers.get("authorization", "")
+    token = auth[7:].strip() if auth.lower().startswith("bearer ") else request.query_params.get("token", "")
+    for valid, name in ACCESS_TOKENS.items():
+        if token and _same(token, valid):
+            return name
+    return None
+
+
 async def handle_health(request: Request):
     return JSONResponse({
         "status":  "ok",
         "name":    "criminomos",
         "arrets":  len(ARRETS),
-        "version": "18.0",
-        "auth":    "disabled",
+        "version": "19.0",
+        "auth":    "token" if ACCESS_TOKENS else "disabled",
     })
 
 
 async def handle_reload(request: Request):
     global ARRETS, ARRETS_BY_ID
-    key = request.query_params.get("key", "")
-    if key != RELOAD_KEY:
-        return JSONResponse({"error": "Clé invalide"}, status_code=403)
+    denied = _admin_denied(request)
+    if denied:
+        return denied
     try:
         ARRETS, ARRETS_BY_ID = load_from_gdrive()
         return JSONResponse({"status": "ok", "arrets": len(ARRETS)})
@@ -671,16 +713,16 @@ async def handle_reload(request: Request):
 
 
 async def handle_log(request: Request):
-    key = request.query_params.get("key", "")
-    if key != RELOAD_KEY:
-        return JSONResponse({"error": "Clé invalide"}, status_code=403)
+    denied = _admin_denied(request)
+    if denied:
+        return denied
     return JSONResponse({"total": len(ACCESS_LOG), "entries": list(reversed(ACCESS_LOG[-100:]))})
 
 
 async def handle_mcp(request: Request):
     if request.method == "GET":
         return JSONResponse(
-            {"name": "criminomos", "version": "18.0", "protocolVersion": "2025-11-25"},
+            {"name": "criminomos", "version": "19.0", "protocolVersion": "2025-11-25"},
             headers={"MCP-Protocol-Version": "2025-11-25"}
         )
     if request.method == "HEAD":
@@ -689,6 +731,12 @@ async def handle_mcp(request: Request):
         return Response(status_code=200)
 
     ip = request.client.host if request.client else "unknown"
+    client = _client_name(request)
+    if client is None:
+        log_access("refused", ip, "auth")
+        return JSONResponse({"jsonrpc": "2.0", "id": None,
+                             "error": {"code": -32001, "message": "Jeton d'accès manquant ou invalide"}},
+                            status_code=401)
 
     try:
         data = await request.json()
@@ -701,11 +749,11 @@ async def handle_mcp(request: Request):
 
     if method == "initialize":
         sid = str(uuid.uuid4())
-        log_access("anonymous", ip, "connect")
+        log_access(client, ip, "connect")
         resp = ok(req_id, {
             "protocolVersion": "2025-11-25",
             "capabilities":    {"tools": {"listChanged": False}},
-            "serverInfo":      {"name": "criminomos", "version": "18.0"}
+            "serverInfo":      {"name": "criminomos", "version": "19.0"}
         })
         resp.headers["mcp-session-id"] = sid
         return resp
@@ -717,13 +765,13 @@ async def handle_mcp(request: Request):
         return ok(req_id, {})
 
     if method == "tools/list":
-        log_access("anonymous", ip, "tools/list")
+        log_access(client, ip, "tools/list")
         return ok(req_id, {"tools": TOOLS})
 
     if method == "tools/call":
         tool = params.get("name", "")
         args = params.get("arguments", {})
-        log_access("anonymous", ip, "call:" + tool)
+        log_access(client, ip, "call:" + tool)
         try:
             result = call_tool(tool, args)
         except Exception as e:
