@@ -216,11 +216,12 @@ TOOLS = [
     },
     {
         "name": "get_fulltext",
-        "description": "Charge le texte integral d un arret depuis bger.ch.",
+        "description": "Charge le texte integral d un arret (bger.ch, repli entscheidsuche.ch). Texte long : demander les pages suivantes avec le parametre page.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "arret_id": {"type": "string", "description": "Numero d arret ex: 6B_409/2024"}
+                "arret_id": {"type": "string", "description": "Numero d arret ex: 6B_409/2024"},
+                "page":     {"type": "integer", "description": "Page du texte, a partir de 1 (defaut 1). Les arrets longs sont decoupes en pages ; l en-tete indique le nombre total de pages."}
             },
             "required": ["arret_id"]
         }
@@ -252,11 +253,12 @@ Par defaut explore 2 niveaux. Pour une recherche exhaustive, utilisez profondeur
     },
     {
         "name": "get_arret_by_reference",
-        "description": "Charge le texte d un ATF ou arret TF cite en reference.",
+        "description": "Charge le texte d un ATF ou arret TF cite en reference. Texte long : demander les pages suivantes avec le parametre page.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "reference": {"type": "string", "description": "ex: ATF 148 IV 409 ou 6B_123/2021"}
+                "reference": {"type": "string", "description": "ex: ATF 148 IV 409 ou 6B_123/2021"},
+                "page":     {"type": "integer", "description": "Page du texte, a partir de 1 (defaut 1). Les arrets longs sont decoupes en pages ; l en-tete indique le nombre total de pages."}
             },
             "required": ["reference"]
         }
@@ -438,13 +440,67 @@ def _extract_refs(text, arret_id=""):
     return atf_refs, tf_refs
 
 
-def get_fulltext(arret_id):
+# ---------------------------------------------------------------------------
+# Pagination des textes longs
+# ---------------------------------------------------------------------------
+PAGE_SIZE      = 40000          # caracteres par page
+TEXT_CACHE_TTL = 30 * 60        # secondes : evite de retelecharger a chaque page
+TEXT_CACHE_MAX = 50
+_TEXT_CACHE    = {}             # cle -> (horodatage, valeur)
+
+
+def _cached(key, loader):
+    now = datetime.now(timezone.utc).timestamp()
+    hit = _TEXT_CACHE.get(key)
+    if hit and now - hit[0] < TEXT_CACHE_TTL:
+        return hit[1]
+    value = loader()
+    _TEXT_CACHE[key] = (now, value)
+    if len(_TEXT_CACHE) > TEXT_CACHE_MAX:
+        oldest = min(_TEXT_CACHE, key=lambda k: _TEXT_CACHE[k][0])
+        _TEXT_CACHE.pop(oldest, None)
+    return value
+
+
+def _split_pages(text, size=PAGE_SIZE):
+    """Decoupe en pages d au plus `size` caracteres, en coupant de preference
+    a une fin de ligne pour ne pas trancher un considerant en plein mot."""
+    pages, start = [], 0
+    while start < len(text):
+        end = min(start + size, len(text))
+        if end < len(text):
+            nl = text.rfind("\n", start + size // 2, end)
+            if nl != -1:
+                end = nl + 1
+        pages.append(text[start:end])
+        start = end
+    return pages or [""]
+
+
+def _paginate(header, text, page, next_call):
+    pages = _split_pages(text)
+    total = len(pages)
     try:
-        text, url, source = fetch_arret(arret_id)
-        return ("Arret " + arret_id + "\nSource : " + source + "\nURL : " + url
-                + "\n" + "-"*60 + "\n\n" + text[:30000])
+        page = int(page or 1)
+    except (TypeError, ValueError):
+        page = 1
+    if page < 1 or page > total:
+        return f"Erreur : page {page} inexistante (1 a {total})."
+    out = header + f"\nPage {page}/{total}\n" + "-"*60 + "\n\n" + pages[page - 1]
+    if page < total:
+        out += f"\n\n[Suite : page {page + 1}/{total} — {next_call(page + 1)}]"
+    return out
+
+
+def get_fulltext(arret_id, page=1):
+    arret_id = arret_id.strip()
+    try:
+        text, url, source = _cached(("arret", arret_id), lambda: fetch_arret(arret_id))
     except Exception as e:
         return "Erreur : " + str(e)
+    header = "Arret " + arret_id + "\nSource : " + source + "\nURL : " + url
+    return _paginate(header, text, page,
+                     lambda p: f'get_fulltext(arret_id="{arret_id}", page={p})')
 
 
 def get_references(arret_id):
@@ -552,20 +608,21 @@ def get_references_deep(arret_id, max_refs=10, profondeur=2):
     return "\n".join(lines)
 
 
-def get_arret_by_reference(reference):
+def get_arret_by_reference(reference, page=1):
     reference = reference.strip()
     if re.match(r"^[0-9][A-Z]{1,2}_\d{1,4}/20\d{2}$", reference):
-        return get_fulltext(reference)
+        return get_fulltext(reference, page)
     m = re.match(r"ATF\s+(\d{2,3})\s+([IVX]+)\s+(\d+)", reference, re.IGNORECASE)
     if m:
         vol, part, page = m.groups()
         url = ("https://www.bger.ch/ext/eurospider/live/fr/php/clir/http/index.php"
                f"?lang=fr&type=show_document&highlight_docid=atf:///{vol}/{part}/{page}")
         try:
-            text = _fetch_text(url)
-            return reference + "\nURL : " + url + "\n" + "-"*60 + "\n\n" + text[:30000]
+            text = _cached(("atf", url), lambda: _fetch_text(url))
         except Exception as e:
             return "Erreur : " + str(e)
+        return _paginate(reference + "\nURL : " + url, text, page,
+                         lambda p: f'get_arret_by_reference(reference="{reference}", page={p})')
     return "Format non reconnu : " + reference
 
 
