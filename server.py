@@ -624,13 +624,19 @@ def get_arret_by_reference(reference, page=1):
         return get_fulltext(reference, page)
     m = re.match(r"ATF\s+(\d{2,3})\s+([IVX]+)\s+(\d+)", reference, re.IGNORECASE)
     if m:
-        vol, part, page = m.groups()
+        # 'atf_page' : page de l'ATF dans le recueil, à ne pas confondre avec
+        # 'page', la page de texte demandée (pagination)
+        vol, part, atf_page = m.groups()
         url = ("https://www.bger.ch/ext/eurospider/live/fr/php/clir/http/index.php"
-               f"?lang=fr&type=show_document&highlight_docid=atf:///{vol}/{part}/{page}")
+               f"?lang=fr&type=show_document&highlight_docid=atf:///{vol}/{part}/{atf_page}")
         try:
             text = _cached(("atf", url), lambda: _fetch_text(url))
         except Exception as e:
             return "Erreur : " + str(e)
+        if not _looks_like_decision(text):
+            _TEXT_CACHE.pop(("atf", url), None)
+            return ("Erreur : " + reference + " — bger.ch a renvoyé une page sans le texte de l'ATF. "
+                    "URL : " + url)
         return _paginate(reference + "\nURL : " + url, text, page,
                          lambda p: f'get_arret_by_reference(reference="{reference}", page={p})')
     return "Format non reconnu : " + reference
