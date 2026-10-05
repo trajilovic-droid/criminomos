@@ -1,5 +1,5 @@
 # Criminomos - Serveur MCP v18
-# Sans authentification + fix SSL bger.ch + recherche profonde niveau 3
+# Sans authentification + TLS bger.ch vérifié + repli entscheidsuche.ch + recherche profonde niveau 3
 import json
 import re
 import unicodedata
@@ -7,10 +7,13 @@ import os
 import uuid
 import logging
 import io
+import ssl
+from urllib.parse import urlencode
 from pathlib import Path
 from collections import defaultdict
 from datetime import datetime, timezone
 
+import certifi
 import httpx
 import pandas as pd
 from openpyxl import load_workbook
@@ -321,15 +324,109 @@ def search_arrets(query="", infraction="", article="", annee="", langue="", limi
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Accès aux textes intégraux (bger.ch, repli entscheidsuche.ch)
+# ---------------------------------------------------------------------------
+# www.bger.ch envoie une chaîne de certificats incomplète : l'intermédiaire
+# DigiCert ci-dessous manque. Les navigateurs le complètent seuls, Python non.
+# On l'ajoute au contexte TLS au démarrage au lieu de désactiver la
+# vérification (verify=False exposait les requêtes à une interception).
+DIGICERT_INTERMEDIATE_URL = (
+    "https://cacerts.digicert.com/DigiCertGlobalG2TLSRSASHA2562020CA1-1.crt.pem"
+)
+
+
+def _build_ssl_context():
+    ctx = ssl.create_default_context(cafile=certifi.where())
+    try:
+        pem = httpx.get(DIGICERT_INTERMEDIATE_URL, timeout=15).text
+        if "BEGIN CERTIFICATE" in pem:
+            ctx.load_verify_locations(cadata=pem)
+            logger.info("Intermédiaire DigiCert ajouté au contexte TLS")
+    except Exception as e:
+        logger.warning(f"Intermédiaire DigiCert non chargé ({e}) — www.bger.ch peut échouer")
+    return ctx
+
+
+SSL_CTX = _build_ssl_context()
+HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; Criminomos/1.0; +https://criminomos.ch)",
+    "Accept-Language": "fr-CH,fr;q=0.9",
+}
+# Code de cour utilisé par entscheidsuche.ch dans ses noms de fichiers
+ENTSCHEIDSUCHE_CHAMBRES = {"6B": "006", "7B": "007"}
+ARRET_ID_RE = re.compile(r"^(?P<cour>\d[A-Z]{1,2})_(?P<num>\d{1,4})/(?P<annee>20\d{2})$")
+
+
 def _fetch_text(url):
-    # verify=False nécessaire : bger.ch a une chaîne de certificats non reconnue sur Render
-    resp = httpx.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"},
-                     follow_redirects=True, verify=False)
+    resp = httpx.get(url, timeout=20, headers=HTTP_HEADERS,
+                     follow_redirects=True, verify=SSL_CTX)
+    resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
     for tag in soup(["script", "style", "nav", "header", "footer"]):
         tag.decompose()
     lines = [l.rstrip() for l in soup.get_text(separator="\n").splitlines() if l.strip()]
     return "\n".join(lines)
+
+
+def _looks_like_decision(text, marker=""):
+    """search.bger.ch renvoie parfois la coquille Eurospider sans l'arrêt
+    ("Back / false"). On n'accepte qu'un texte long qui contient le numéro."""
+    return len(text) > 3000 and (not marker or marker in text)
+
+
+def _decision_date(arret_id):
+    arret = ARRETS_BY_ID.get(arret_id) or {}
+    raw = (arret.get("decision") or "").strip()[:10]
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def _candidate_urls(arret_id):
+    """URL à essayer, dans l'ordre. Construites à partir du numéro et de la
+    date de décision : les URL stockées dans la Sheet sont parfois fausses
+    (mauvais numéro, date erronée, préfixe 'aza://' en double)."""
+    m = ARRET_ID_RE.match(arret_id)
+    d = _decision_date(arret_id)
+    urls = []
+    if m and d:
+        docid = f"aza://{d:%d-%m-%Y}-{m['cour']}_{m['num']}-{m['annee']}"
+        urls.append(("bger.ch",
+                     "https://search.bger.ch/ext/eurospider/live/fr/php/aza/http/index.php?"
+                     + urlencode({"lang": "fr", "type": "show_document",
+                                  "highlight_docid": docid})))
+        code = ENTSCHEIDSUCHE_CHAMBRES.get(m["cour"])
+        if code:
+            urls.append(("entscheidsuche.ch",
+                         "https://entscheidsuche.ch/docs/CH_BGer/"
+                         f"CH_BGer_{code}_{m['cour']}-{m['num']}-{m['annee']}_{d:%Y-%m-%d}.html"))
+    stored = (ARRETS_BY_ID.get(arret_id) or {}).get("url")
+    if stored and all(stored != u for _, u in urls):
+        urls.append(("bger.ch (URL de la base)", stored))
+    return urls
+
+
+def fetch_arret(arret_id):
+    """Retourne (texte, url, source). Lève RuntimeError avec le détail de
+    chaque tentative si aucune source ne renvoie le texte de l'arrêt."""
+    arret_id = arret_id.strip()
+    urls = _candidate_urls(arret_id)
+    if not urls:
+        raise RuntimeError(
+            f"{arret_id} : arrêt absent de la base, date de décision inconnue — "
+            "impossible de construire l'adresse du texte")
+    attempts = []
+    for source, url in urls:
+        try:
+            text = _fetch_text(url)
+            if _looks_like_decision(text, arret_id):
+                return text, url, source
+            attempts.append(f"{source} : page sans texte d'arrêt")
+        except Exception as e:
+            attempts.append(f"{source} : {e}")
+    raise RuntimeError(f"{arret_id} introuvable — " + " | ".join(attempts))
 
 
 def _extract_refs(text, arret_id=""):
@@ -341,28 +438,18 @@ def _extract_refs(text, arret_id=""):
     return atf_refs, tf_refs
 
 
-def _arret_url(arret_id):
-    arret = ARRETS_BY_ID.get(arret_id)
-    if arret and arret.get("url"):
-        return arret["url"]
-    cid = re.sub(r"[^A-Za-z0-9_/.-]", "", arret_id)[:40]
-    return ("https://www.bger.ch/ext/eurospider/live/fr/php/aza/http/index.php"
-            f"?lang=fr&type=show_document&highlight_docid=aza://{cid}")
-
-
 def get_fulltext(arret_id):
-    url = _arret_url(arret_id)
     try:
-        text = _fetch_text(url)
-        return "Arret " + arret_id + "\nURL : " + url + "\n" + "-"*60 + "\n\n" + text[:30000]
+        text, url, source = fetch_arret(arret_id)
+        return ("Arret " + arret_id + "\nSource : " + source + "\nURL : " + url
+                + "\n" + "-"*60 + "\n\n" + text[:30000])
     except Exception as e:
         return "Erreur : " + str(e)
 
 
 def get_references(arret_id):
-    url = _arret_url(arret_id)
     try:
-        text = _fetch_text(url)
+        text, _, _ = fetch_arret(arret_id)
     except Exception as e:
         return "Erreur : " + str(e)
     atf_refs, tf_refs = _extract_refs(text, arret_id)
@@ -387,10 +474,9 @@ def get_references(arret_id):
 def get_references_deep(arret_id, max_refs=10, profondeur=2):
     max_refs   = min(int(max_refs), 15)
     profondeur = min(max(int(profondeur), 2), 3)
-    url        = _arret_url(arret_id)
     lines      = ["=== REFERENCES PROFONDES (niveau " + str(profondeur) + ") : " + arret_id + " ===\n"]
     try:
-        text1 = _fetch_text(url)
+        text1, _, _ = fetch_arret(arret_id)
     except Exception as e:
         return "Erreur : " + str(e)
     atf1, tf1 = _extract_refs(text1, arret_id)
@@ -406,7 +492,7 @@ def get_references_deep(arret_id, max_refs=10, profondeur=2):
         if ref_id in explored_tf: continue
         explored_tf.add(ref_id)
         try:
-            text2     = _fetch_text(_arret_url(ref_id))
+            text2, _, _ = fetch_arret(ref_id)
             atf2, tf2 = _extract_refs(text2, ref_id)
             niveau2_tf_refs[ref_id] = (atf2, tf2)
             meta  = ARRETS_BY_ID.get(ref_id)
@@ -452,7 +538,7 @@ def get_references_deep(arret_id, max_refs=10, profondeur=2):
             for ref_id in niveau3_candidates:
                 explored_tf.add(ref_id)
                 try:
-                    text3     = _fetch_text(_arret_url(ref_id))
+                    text3, _, _ = fetch_arret(ref_id)
                     atf3, tf3 = _extract_refs(text3, ref_id)
                     meta      = ARRETS_BY_ID.get(ref_id)
                     objet     = meta.get("objet", "—") if meta else "hors base"
